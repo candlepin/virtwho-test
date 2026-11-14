@@ -14,11 +14,12 @@ import pytest
 
 from virtwho import RHEL_COMPOSE, TEST_RPMS, VIRTWHO_PKG
 from virtwho.base import (
-    dnf_download_pkg,
     package_check,
     package_install,
     package_uninstall,
     random_string,
+    virtwho_download_under_test,
+    virtwho_install_under_test,
 )
 
 pytestmark = pytest.mark.notImageMode
@@ -36,16 +37,32 @@ class TestInstallUninstall:
         :customerscenario: false
         :steps:
             1. uninstall virt-who by #dnf remove virt-who
-            2. install virt-who by #dnf install virt-who
+            2. install the version under test by #dnf install
             3. check the /etc/virt-who.d/template.conf
         :expectedresults:
-            1. virt-who can be removed and reinstalled from repos successfully.
+            1. virt-who can be removed and the version under test
+               reinstalled successfully (TEST_RPMS when set, else the
+               compose-provided package -- never the destination's
+               content repo, which does not serve virt-who in the
+               container tier).
             2.
         """
         try:
-            package_uninstall(ssh_host, "virt-who")
+            # Keep virt-who's dependencies installed through the
+            # remove: dnf5 (RHEL-10) cleans automatically-installed
+            # dependencies together with the package
+            # (clean_requirements_on_remove), and the repo-less
+            # reinstall of the version under test below could no
+            # longer resolve a removed python3-cryptography.
+            package_uninstall(ssh_host, "virt-who", keep_deps=True)
             assert package_check(ssh_host, "virt-who") is False
-            package_install(ssh_host, "virt-who")
+            # reinstall the VERSION UNDER TEST
+            # (TEST_RPMS has precedence, else the compose-provided
+            # RPM cached at prepare time), never whatever the
+            # currently-enabled content repos serve -- the container
+            # tier's registered host gets its content from the pod's
+            # repo, which does not carry virt-who.
+            virtwho_install_under_test(ssh_host)
             if TEST_RPMS:
                 assert package_check(ssh_host, "virt-who") is not False
             else:
@@ -80,10 +97,15 @@ class TestInstallUninstall:
             lines = output.strip().split("\n")
             assert len(lines) == line_num
         finally:
-            if TEST_RPMS:
-                ssh_host.runcmd(f"dnf -y install --allowerasing {TEST_RPMS}")
-            elif package_check(ssh_host, "virt-who") is False:
-                package_install(ssh_host, "virt-who")
+            # Cascade guard: the version under test is reinstalled
+            # unconditionally, whatever happened in the body above --
+            # a virt-who-less suite cascades into every later test.
+            # In gating mode (TEST_RPMS) this restores the gating
+            # build even when some other version is present; in
+            # compose mode the helper is a no-op success when the
+            # version under test is already installed. It raises
+            # loudly on a failed install -- never a silent continue.
+            virtwho_install_under_test(ssh_host)
 
     @pytest.mark.tier1
     def test_install_uninstall_by_rpm(self, ssh_host):
@@ -96,7 +118,9 @@ class TestInstallUninstall:
         :customerscenario: false
         :steps:
             1. uninstall virt-who by #rpm -e
-            2. download virt-who RPM from system repos using dnf download
+            2. fetch the version-under-test RPM (the undertest
+               cache; dnf download only as the hand-run local
+               fallback when no cache exists)
             3. install virt-who by #rpm -ivh
         :expectedresults:
             1. virt-who can be removed and reinstalled successfully.
@@ -104,7 +128,14 @@ class TestInstallUninstall:
         file_path = None
         try:
             file_path = "/tmp/packageInstallUninstall-" + random_string()
-            rpm_path = dnf_download_pkg(ssh_host, "virt-who", file_path)
+            # Source the rpm from the undertest cache -- the version
+            # under test, never the enabled repos: after registration
+            # the destination's content repo is the only enabled one
+            # and is dead by design in the container tier. The
+            # precedence mirrors virtwho_install_under_test(): cache
+            # first, enabled repos only as the hand-run local
+            # fallback.
+            rpm_path = virtwho_download_under_test(ssh_host, file_path)
 
             package_uninstall(ssh_host, "virt-who", rpm=VIRTWHO_PKG)
             assert package_check(ssh_host, "virt-who") is False
@@ -115,10 +146,10 @@ class TestInstallUninstall:
             else:
                 assert package_check(ssh_host, "virt-who") == VIRTWHO_PKG
         finally:
-            if TEST_RPMS:
-                ssh_host.runcmd(f"dnf -y install --allowerasing {TEST_RPMS}")
-            else:
-                if package_check(ssh_host, "virt-who") is False:
-                    package_install(ssh_host, "virt-who")
+            # the same cascade guard as by_dnf: the version under
+            # test is reinstalled unconditionally through the
+            # precedence helper, loudly raising on failure; the temp
+            # dir is cleaned.
+            virtwho_install_under_test(ssh_host)
             if file_path:
                 ssh_host.runcmd(f"rm -rf {file_path}")

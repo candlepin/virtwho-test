@@ -5,7 +5,12 @@ import time
 
 from virtwho import HYPERVISOR, PRINT_JSON_FILE, FailException, logger
 from virtwho.base import msg_search
-from virtwho.configure import get_hypervisor_handler, virtwho_ssh_connect
+from virtwho.configure import (
+    get_hypervisor_handler,
+    get_register_handler,
+    virtwho_ssh_connect,
+)
+from virtwho.destination import normalize_prefix
 
 
 class VirtwhoRunner:
@@ -338,12 +343,21 @@ class VirtwhoRunner:
         if "0 hypervisors and 0 guests found" in rhsm_log:
             msg = "0 hypervisors and 0 guests found"
         elif "virtwho.main DEBUG" in rhsm_log or "rhsm.connection DEBUG" in rhsm_log:
-            if "satellite" in self.register_type:
-                prefix = "/rhsm"
-            elif "rhsm" in self.register_type:
-                prefix = "/subscription"
-            else:
-                prefix = ""
+            # Prefix-aware: the report/heartbeat request
+            # lines carry the ini-configured prefix (e.g.
+            # request="POST /candlepin/hypervisors/..."), so the
+            # count reads zero against any destination whose prefix
+            # is not /subscription -- read it from the register
+            # section, falling back to the per-tier defaults. A
+            # register type whose section the ini does not carry
+            # (e.g. the unwired rhsm_sw tier) also falls back to the
+            # default instead of raising at log-analysis time.
+            try:
+                register = get_register_handler(self.register_type)
+                configured = getattr(register, "prefix", "")
+            except AttributeError:
+                configured = ""
+            prefix = normalize_prefix(configured, self.register_type)
             if prefix:
                 if self.mode == "local":
                     msg = (

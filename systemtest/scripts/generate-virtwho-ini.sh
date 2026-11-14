@@ -43,6 +43,25 @@
 # Fallback mode (VIRTWHO_INI_URL unset): generate the complete ini from
 # the VIRTWHO_* environment variables alone.
 #
+# Destination knob (VIRTWHO_DESTINATION, plan-level non-secret):
+#   container (DEFAULT) -- the containerized Candlepin tier. [rhsm]
+#     carries the SYNTHETIC values of the checked-in
+#     systemtest/config/virtwho-container.ini (public-by-design test
+#     data baked into the ghcr.io/candlepin images, NOT sentinels and
+#     NOT env secrets): the base's [rhsm] sentinels are neither
+#     resolved nor kept, VIRTWHO_RHSM_* env secrets do NOT overlay
+#     the section (a stale stage secret from an old pipeline must
+#     not break the hermetic run -- they are ignored with a warning),
+#     and the proxy options are cleared (the destination is local).
+#     This makes the CI tier hermetic: no Vault, no stage egress, no real
+#     credentials in the default path. The pod is deployed by
+#     prepare-candlepin.sh.
+#   stage -- today's sentinel flow, unchanged: the base's [rhsm]
+#     sentinels resolve from Vault and VIRTWHO_RHSM_* env secrets
+#     win (the scheduled fidelity tier).
+# The selected tier is recorded in [job] destination so the suite
+# knows which contract the ini was built for.
+#
 # The environment variables map onto the sections/options of
 # virtwho.ini.sample (option names are lower-cased into the ini):
 #
@@ -119,8 +138,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
 OUTPUT=${1:-/dev/shm/virtwho.ini}
-# Single materialization (review PR297-10): when OUTPUT is a symlink
+# Single materialization: when OUTPUT is a symlink
 # (the test tree's view of the tmpfs ini), resolve it and write
 # THROUGH to the target -- the atomic mv below would otherwise
 # replace the link with a regular file and silently strand the tmpfs
@@ -129,37 +150,39 @@ if [ -L "$OUTPUT" ]; then
     OUTPUT=$(readlink -f "$OUTPUT")
 fi
 
-# [job] plan-level aliases (review PR297-09): when the plan-level
-# variable is unset, promote the prefixed VIRTWHO_JOB_* value into it
-# BEFORE any ${VAR:-default} evaluation -- here (HYP below, the
-# python invocation) and in the wrapper scripts, which run this
-# generator as a child and evaluate the same variables themselves
-# (test-file pruning, compose resolution, SSH trust). Promoting here
-# is what makes the alias feed hyp: VIRTWHO_JOB_HYPERVISOR=libvirt
-# must yield a [libvirt] section, not just [job] hypervisor=libvirt
-# (the suite reads the section at import time and fails at conftest
-# otherwise). VIRTWHO_JOB_HYPERVISOR is lower-cased because
-# get_hypervisor_handler only matches the lower-case mode list -- an
-# upper-case alias must not silently select the ESX handler. A set
-# plan-level variable is never overridden here; the python side warns
-# when it disagrees with the alias.
-if [ -z "${HYPERVISOR:-}" ] && [ -n "${VIRTWHO_JOB_HYPERVISOR:-}" ]; then
-    HYPERVISOR=$(printf '%s' "$VIRTWHO_JOB_HYPERVISOR" | tr '[:upper:]' '[:lower:]')
-    export HYPERVISOR
-fi
-if [ -z "${REGISTER:-}" ] && [ -n "${VIRTWHO_JOB_REGISTER:-}" ]; then
-    REGISTER="$VIRTWHO_JOB_REGISTER"
-    export REGISTER
-fi
-if [ -z "${RHEL_COMPOSE:-}" ] && [ -n "${VIRTWHO_JOB_RHEL_COMPOSE:-}" ]; then
-    RHEL_COMPOSE="$VIRTWHO_JOB_RHEL_COMPOSE"
-    export RHEL_COMPOSE
-fi
+# [job] plan-level aliases, single-sourced in
+# lib.sh: promote VIRTWHO_JOB_* into the plan-level variables BEFORE
+# any ${VAR:-default} evaluation -- here (HYP below, the python
+# invocation) and in the wrapper scripts, which run this generator as
+# a child and evaluate the same variables themselves (test-file
+# pruning, compose resolution, SSH trust). Promoting here is what
+# makes the alias feed hyp: VIRTWHO_JOB_HYPERVISOR=libvirt must yield
+# a [libvirt] section, not just [job] hypervisor=libvirt (the suite
+# reads the section at import time and fails at conftest otherwise).
+# A set plan-level variable is never overridden here; the python side
+# warns when it disagrees with the alias.
+promote_job_aliases
 HYP=$(printf '%s' "${HYPERVISOR:-esx}" | tr '[:upper:]' '[:lower:]')
 # REGISTER is normalised like HYP: a mixed-case value would otherwise
 # match no ini section and silently skip the register section's
 # sentinel resolution.
 REGISTER=$(printf '%s' "${REGISTER:-rhsm}" | tr '[:upper:]' '[:lower:]')
+# Destination knob: container (default, the hermetic CI tier) or
+# stage (the sentinel flow). Validated here so a typo fails with a
+# clean one-line error instead of a silently wrong tier; exported
+# for the python half and threaded to [job] destination.
+DESTINATION=${VIRTWHO_DESTINATION:-container}
+case "$DESTINATION" in
+    container | stage) ;;
+    *)
+        echo "ERROR: VIRTWHO_DESTINATION must be 'container' or 'stage' (got: ${DESTINATION})" >&2
+        exit 1
+        ;;
+esac
+export DESTINATION
+# The checked-in container overlay (synthetic values only -- see the
+# header of that file); consumed by the python half in container mode.
+CONTAINER_INI="${SCRIPT_DIR}/../config/virtwho-container.ini"
 
 # Legacy alias: KUBEVIRT_TOKEN maps onto VIRTWHO_KUBEVIRT_TOKEN (the
 # new name wins when both are set). run-tests.sh regenerates the ini
@@ -204,14 +227,17 @@ if [ -n "${VIRTWHO_INI_URL:-}" ]; then
     # Hard fail on download errors: a silently missing base would
     # produce an ini without its non-secret values and confusing test
     # failures. The env-only fallback only applies when the variable
-    # is unset altogether.
+    # is unset altogether. The bounded-retry flag set is the one
+    # every download site shares (setup-virtwho-test.sh's TEST_RPMS
+    # cache, run-tests.sh's key fetch, base.py's download helper):
+    # --max-time bounds the whole transfer, not just the connect.
     if ! curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 10 \
-        -o "$BASE_FILE" "$VIRTWHO_INI_URL"; then
+        --max-time 300 -o "$BASE_FILE" "$VIRTWHO_INI_URL"; then
         echo "ERROR: failed to download the sanitized base ini from VIRTWHO_INI_URL" >&2
         exit 1
     fi
     echo "Downloaded sanitized base ini from VIRTWHO_INI_URL"
-    # Optional integrity pin (review PR298-23): when VIRTWHO_INI_SHA256
+    # Optional integrity pin: when VIRTWHO_INI_SHA256
     # is set (a plain, non-secret hex digest), verify the downloaded
     # base against it and abort on a mismatch -- the base selects
     # where resolved credentials are sent, so tampering must not pass
@@ -231,7 +257,7 @@ fi
 umask 077
 HYP=$HYP REGISTER=${REGISTER:-rhsm} RHEL_COMPOSE=${RHEL_COMPOSE:-} \
     PYTHONPATH="${SCRIPT_DIR}" \
-    python3 - "$TMP_OUTPUT" "$BASE_FILE" <<'PYEOF'
+    python3 - "$TMP_OUTPUT" "$BASE_FILE" "$CONTAINER_INI" <<'PYEOF'
 import configparser
 import os
 import sys
@@ -240,9 +266,11 @@ import vault_resolve
 
 out_path = sys.argv[1]
 base_path = sys.argv[2]
+container_ini_path = sys.argv[3]
 hyp = os.environ["HYP"]
 register = os.environ["REGISTER"]
 compose = os.environ["RHEL_COMPOSE"]
+destination = os.environ["DESTINATION"]
 
 # Section table: name -> (env prefixes, options). Mirrors
 # virtwho.ini.sample plus the options the pytest suite accesses.
@@ -251,9 +279,11 @@ TABLE = {
         ["JOB"],
         # hypervisor/register/rhel_compose are the plan-level options;
         # their VIRTWHO_JOB_* forms are accepted aliases (see the
-        # preseed below, review PR297-09).
+        # preseed below). destination records the
+        # VIRTWHO_DESTINATION tier the ini was built for (container
+        # or stage) so the suite can tell the contracts apart.
         ["hypervisor", "register", "rhel_compose", "rhel_compose_path",
-         "multi_hypervisors"],
+         "multi_hypervisors", "destination"],
     ),
     "virtwho": (
         ["VIRTWHO"],
@@ -262,8 +292,18 @@ TABLE = {
     ),
     "rhsm": (
         ["RHSM"],
+        # baseurl: the content source subscription-manager
+        # registers against. Always emitted so hand-written inis
+        # without it do not crash SubscriptionManager; env-delivered
+        # in stage mode (VIRTWHO_RHSM_BASEURL); in container mode the
+        # checked-in overlay forces the deliberately-unbound local
+        # port (http://localhost:8080), keeping the tier hermetic:
+        # content access stays local (no CDN fallback, no external
+        # egress) and fails bounded, while no stage CDN leftover can
+        # survive into the section.
         ["server", "username", "password", "prefix", "port",
-         "default_org", "activation_key", "proxy_hostname", "proxy_port"],
+         "baseurl", "default_org", "activation_key", "proxy_hostname",
+         "proxy_port"],
     ),
     "satellite": (
         ["SATELLITE"],
@@ -426,6 +466,14 @@ if base_path:
         if name and name not in active_sections:
             active_sections.append(name)
 
+    # Container destination: [rhsm] is rewritten from the checked-in
+    # container overlay further below, so its sentinels are dead
+    # values -- never resolved, never a resolution target, and never
+    # a reason to require Vault credentials (a hermetic container
+    # cell must run without any Vault wiring at all).
+    if destination == "container":
+        active_sections = [s for s in active_sections if s != "rhsm"]
+
     # Env-supplied credentials are final: an option whose sentinel the
     # environment already overrides is never resolved, so a Vault
     # outage cannot block a cell whose active credentials are all
@@ -451,6 +499,10 @@ if base_path:
 
     resolver = vault_resolve.VaultResolver()
     sentinel_sections = vault_resolve.sections_with_sentinels(cfg)
+    # Same container rule as active_sections above: a sentinel that
+    # the overlay overwrites must not trip the strict knob either.
+    if destination == "container":
+        sentinel_sections.discard("rhsm")
 
     # A sentinel in a section that is never resolved is a base-authoring
     # error: [virtwho], [job] and the pass-through sections take their
@@ -575,7 +627,14 @@ for name, (prefixes, options) in TABLE.items():
 # (e.g. extra options of the sanitized file) -- and over the values
 # resolved from @vault: sentinels above, which preserves the CI-side
 # override of any credential during the transition.
+# EXCEPT in container mode: [rhsm] then comes from the checked-in
+# container overlay (applied below), so the section is skipped here
+# -- a VIRTWHO_RHSM_* stage secret delivered by an old pipeline must
+# not override the hermetic destination. The ignored variables are
+# announced (names only, never values).
 for name in cfg.sections():
+    if destination == "container" and name == "rhsm":
+        continue
     if name in TABLE:
         prefixes = TABLE[name][0]
     else:
@@ -585,10 +644,47 @@ for name in cfg.sections():
         if value:
             cfg.set(name, opt, value)
 
+if destination == "container":
+    ignored_rhsm = sorted(
+        name for name in os.environ if name.startswith("VIRTWHO_RHSM_"))
+    if ignored_rhsm:
+        print("WARNING: VIRTWHO_DESTINATION=container is in effect; "
+              "ignoring %d VIRTWHO_RHSM_* environment variable(s) (%s): "
+              "the [rhsm] section carries the synthetic "
+              "containerized-Candlepin values (set "
+              "VIRTWHO_DESTINATION=stage to deliver them instead)"
+              % (len(ignored_rhsm), ", ".join(ignored_rhsm)),
+              file=sys.stderr)
+
+# Container destination overlay: [rhsm] is forced to the SYNTHETIC
+# values of the checked-in systemtest/config/virtwho-container.ini
+# (public-by-design test data -- not sentinels, not secrets; see that
+# file's header). Applied last so the tier's contract wins over the
+# base and the environment alike. The overlay sets every [rhsm]
+# table option (including the empty activation_key and the cleared
+# proxy options), so no stage leftover can survive into the section.
+if destination == "container":
+    overlay = configparser.ConfigParser(interpolation=None)
+    overlay.optionxform = str
+    try:
+        overlay.read(container_ini_path)
+    except configparser.Error:
+        print("ERROR: could not parse the container overlay %s"
+              % container_ini_path, file=sys.stderr)
+        sys.exit(1)
+    if "rhsm" not in overlay or not overlay.options("rhsm"):
+        print("ERROR: the container overlay %s carries no [rhsm] "
+              "section" % container_ini_path, file=sys.stderr)
+        sys.exit(1)
+    if not cfg.has_section("rhsm"):
+        cfg.add_section("rhsm")
+    for opt in overlay.options("rhsm"):
+        cfg.set("rhsm", opt, overlay.get("rhsm", opt))
+
 # [esx] accepts two prefixes (ESX and VCENTER). When both supply the
 # same option with different values, ESX wins (it is first in the
 # prefix list) -- announce the clash instead of dropping the VCENTER
-# value silently (review PR297-13). Option names only, never values.
+# value silently. Option names only, never values.
 if cfg.has_section("esx"):
     _esx_opts = set(TABLE["esx"][1]) | set(cfg.options("esx"))
     _clashes = []
@@ -617,8 +713,8 @@ if cfg.has_section("kubevirt"):
 if not cfg.has_section("job"):
     cfg.add_section("job")
 # The prefixed VIRTWHO_JOB_HYPERVISOR/_REGISTER/_RHEL_COMPOSE forms
-# are accepted aliases for the same three plan-level options (review
-# PR297-09). The shell side has already promoted an alias into the
+# are accepted aliases for the same three plan-level options.
+# The shell side has already promoted an alias into the
 # plan-level variable when the plan-level variable was unset (feeding
 # hyp and the wrapper scripts' ${VAR:-default} evaluations), so by the
 # time python runs, a winning alias IS the plan-level value and the
@@ -643,6 +739,19 @@ for option, default in PLAN_LEVEL.items():
               % (option.upper(), option.upper(), option.upper()),
               file=sys.stderr)
     cfg.set("job", option, default)
+
+# Record the destination tier (validated on the shell side from
+# VIRTWHO_DESTINATION, default container): the suite reads it to
+# tell the container and stage [rhsm] contracts apart (e.g. the
+# destination-absent skip in tests/conftest.py). A disagreeing
+# VIRTWHO_JOB_DESTINATION alias is announced, never applied -- the
+# knob and the recorded value must agree.
+_prefixed_destination = env_value(["JOB"], "destination")
+if (_prefixed_destination
+        and _prefixed_destination.lower() != destination):
+    print("WARNING: VIRTWHO_JOB_DESTINATION is shadowed by "
+          "VIRTWHO_DESTINATION; %s wins" % destination, file=sys.stderr)
+cfg.set("job", "destination", destination)
 
 # The suite re-parses [job] multi_hypervisors with its own,
 # unnormalized expression (virtwho/base.py hypervisors_list():
@@ -674,4 +783,4 @@ trap - EXIT
 chmod 600 "$OUTPUT"
 
 # Only section names are logged -- never values.
-echo "Generated ${OUTPUT} (mode 0600, mode: $([ -n "${VIRTWHO_INI_URL:-}" ] && echo base+env-overlay || echo env-only)) with sections: $(grep '^\[' "$OUTPUT" | tr -d '[]' | tr '\n' ' ')"
+echo "Generated ${OUTPUT} (mode 0600, mode: $([ -n "${VIRTWHO_INI_URL:-}" ] && echo base+env-overlay || echo env-only), destination: ${DESTINATION}) with sections: $(grep '^\[' "$OUTPUT" | tr -d '[]' | tr '\n' ' ')"

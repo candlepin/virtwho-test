@@ -19,6 +19,14 @@
 ; only from the VIRTWHO_* environment variables, never from Vault.
 ; When VIRTWHO_INI_URL is unset
 ; the complete ini is generated from the VIRTWHO_* secrets alone.
+; Destination tier (CCT-3155): VIRTWHO_DESTINATION=container (the
+; DEFAULT) fills [rhsm] below with the SYNTHETIC values of the
+; checked-in systemtest/config/virtwho-container.ini (public test
+; data of the containerized Candlepin pod that prepare-candlepin.sh
+; deploys per run -- server=candlepin, port=8443, prefix=/candlepin,
+; the pre-baked testuser1 account, org snowwhite); VIRTWHO_RHSM_*
+; env secrets do NOT override the section in that mode (set
+; VIRTWHO_DESTINATION=stage to restore the sentinel flow below).
 ; The test tree holds only a symlink to the tmpfs file, and
 ; systemtest/scripts/cleanup-secrets.sh destroys it in the tmt finish
 ; step. See README.rst for the environment variable contract.
@@ -59,7 +67,7 @@ package=virt-who-1.30.10-1.el10.noarch
 brew=http://brew.example.com/koji/taskinfo?taskID=0
 test_rpms=
 proxy_server=proxy.example.com
-proxy_port=3128
+proxy_port=CHANGE_ME
 
 ; The section of [rhsm] and [satellite] are used to define subscription servers
 ; server is a required option to indicate where to register
@@ -81,7 +89,7 @@ port=443
 default_org=CHANGE_ME
 activation_key=
 proxy_hostname=proxy.example.com
-proxy_port=3128
+proxy_port=CHANGE_ME
 
 [satellite]
 server=satellite.example.com

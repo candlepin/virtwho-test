@@ -1,0 +1,68 @@
+# candlepin-pod.yaml -- Vendored, digest-pinned deployment of the
+# containerized Candlepin destination (CCT-3155).
+#
+# Vendored from candlepin-container-unofficial's candlepin-pod.yaml,
+# :latest tags replaced by @sha256: digests (resolved 2026-11-20).
+# Pinning is deliberate: :latest is republished on every upstream
+# main build and the pre-baked test-data contract (snowwhite org,
+# testuser1 roles, SCA-capable owners) must not change under a run.
+# Refresh the digests deliberately, in sync with the DEFAULT_*_IMAGE
+# literals in prepare-candlepin.sh, and record the date here.
+#
+# Usage (see systemtest/scripts/prepare-candlepin.sh):
+#   podman play kube candlepin-pod.yaml         # start
+#   podman play kube candlepin-pod.yaml --down  # stop
+#
+# The two containers share the pod's network namespace: Candlepin
+# reaches PostgreSQL at localhost:5432. The app's TLS listener is
+# published on hostPort 8443 (>1024: no privileged ports, no
+# sysctls). The two env vars override the db_host baked into
+# candlepin.conf.
+#
+# NO repo container: virt-who tests REPORTING, not content
+# consumption -- the suite never installs from or asserts on the
+# destination's content repos (the version under test comes from
+# TEST_RPMS or the compose). Port 8080 is deliberately not bound:
+# the tier's [rhsm] baseurl points at http://localhost:8080, keeping
+# content access LOCAL (subscription-manager must never fall back to
+# the real CDN) while every content operation fails bounded and
+# locally (connection refused).
+#
+# Startup ordering: both containers start simultaneously (podman
+# play kube cannot express intra-pod ordering). The race is
+# survivable: the app container's restart policy is "always", and
+# PostgreSQL (baked PGDATA) starts in ~1-2 s while the Tomcat JVM
+# needs 10-30 s to reach webapp deploy. If the app still loses the
+# race, prepare-candlepin.sh fails loudly (HTTP-200-only readiness
+# plus the assert-candlepin-tier.sh run guard) -- never a vacuous
+# green.
+#
+# The images are PUBLIC ghcr.io test images carrying SYNTHETIC test
+# data only (pre-baked orgs/users/products of the Candlepin test
+# suite) -- public-by-design, no registry credentials needed.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: candlepin
+  labels:
+    app: candlepin
+spec:
+  containers:
+    - name: candlepin-db
+      image: ghcr.io/candlepin/candlepin-db@sha256:4bf8b27d20fa77d2afff60723ce2ed5058e2337cbf26b2db81f116fe956b5d5b
+      ports:
+        - containerPort: 5432
+          protocol: TCP
+
+    - name: candlepin-app
+      image: ghcr.io/candlepin/candlepin-app@sha256:bba274fd2af841bcf15ef5d975f4d99902a58e1599eae6e95017d4f2ac3751a3
+      env:
+        - name: JPA_CONFIG_HIBERNATE_CONNECTION_URL
+          value: jdbc:postgresql://localhost/candlepin
+        - name: ORG_QUARTZ_DATASOURCE_MYDS_URL
+          value: jdbc:postgresql://localhost/candlepin
+      ports:
+        - containerPort: 8443
+          hostPort: 8443
+          protocol: TCP

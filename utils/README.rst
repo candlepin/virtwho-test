@@ -62,7 +62,7 @@ All the utils/*.py are defined as public tools.
 
 * Below is an examples to run with required arguments.
 
-    # python3 docker.py --rhel-compose=RHEL-8.6.0-20220111.0 --docker-server=10.73.3.99 --docker-username=root --docker-password=password --container-name=test --container-port=33333 --container-username=root --container-password=password
+    # python3 docker.py --rhel-compose=RHEL-8.6.0-20220111.0 --docker-server=192.0.2.10 --docker-username=root --docker-password=password --container-name=test --container-port=33333 --container-username=root --container-password=password
 
 
 `kickstart.py`_ is used to install rhel host by grub.
@@ -78,8 +78,15 @@ All the utils/*.py are defined as public tools.
 
 * Below is an examples to run with required arguments.
 
-    # python3 kickstart.py --rhel-compose=RHEL-8.6.0-20220111.0 --server=10.73.3.234 --username=root --password=password
+    # python3 kickstart.py --rhel-compose=RHEL-8.6.0-20220111.0 --server=192.0.2.10 --username=root --password=password
 
+
+`polarion_testcase_upload.py`_ and `polarion_testrun_import.py`_ are
+used to import test cases and test runs into Polarion. Set the
+``POLARION_USER``, ``POLARION_PASS`` and ``POLARION_URL`` environment
+variables (or pass the equivalent command-line options) before running them;
+there is no default URL. This Polarion tooling is slated for
+replacement by a new service in a follow-up change.
 
 .. _beaker.py:
     https://github.com/candlepin/virtwho-test/blob/master/utils/beaker.py
@@ -87,5 +94,9 @@ All the utils/*.py are defined as public tools.
     https://github.com/candlepin/virtwho-test/blob/master/utils/docker.py
 .. _kickstart.py:
     https://github.com/candlepin/virtwho-test/blob/master/utils/kickstart.py
+.. _polarion_testcase_upload.py:
+    https://github.com/candlepin/virtwho-test/blob/master/utils/polarion_testcase_upload.py
+.. _polarion_testrun_import.py:
+    https://github.com/candlepin/virtwho-test/blob/master/utils/polarion_testrun_import.py
 .. _satellite.py:
     https://github.com/candlepin/virtwho-test/blob/master/utils/satellite.py

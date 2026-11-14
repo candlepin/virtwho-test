@@ -185,8 +185,11 @@ def arguments_parser():
     parser.add_argument(
         "--url",
         required=False,
-        default="https://polarion.engineering.redhat.com/polarion/import/testcase",
-        help="The polarion url to import test cases",
+        default=os.environ.get(
+            "POLARION_URL",
+            "https://polarion.example.invalid/polarion/import/testcase",
+        ),
+        help="The polarion url to import test cases (default: the POLARION_URL environment variable, else a placeholder)",
     )
     parser.add_argument(
         "--username",
