@@ -76,7 +76,7 @@ load manifest and set for virt-who testing.
 * Below are examples to run the file with required arguments.
 
     * # python3 virtwho_satellite.py --version=6.9 --repo=cdn --rhel-compose=RHEL-7.9-20200917.0
-    * # python3 virtwho_satellite.py --version=6.10 --repo=dogfood --rhel-compose=RHEL-7.9-20200917.0 --server=ent-02-vm-x.lab.eng.nay.redhat.com --ssh-username=root --ssh-password=redhat --admin-username=admin --admin-password=password
+    * # python3 virtwho_satellite.py --version=6.10 --repo=dogfood --rhel-compose=RHEL-7.9-20200917.0 --server=satellite.example.invalid --ssh-username=root --ssh-password=redhat --admin-username=admin --admin-password=password
 
 
 

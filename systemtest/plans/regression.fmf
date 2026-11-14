@@ -37,3 +37,8 @@ discover:
 
 execute:
     how: tmt
+
+finish:
+    - name: Clean up generated secrets
+      how: shell
+      script: ./systemtest/scripts/cleanup-secrets.sh

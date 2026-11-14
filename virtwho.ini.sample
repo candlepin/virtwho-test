@@ -1,28 +1,62 @@
+; SAMPLE ONLY -- every value below is an obviously fake placeholder
+; (RFC 2606 / RFC 5737: *.example.com, *.example.invalid, 192.0.2.0/24,
+; all-zero UUIDs, CHANGE_ME). Never put real hosts or credentials in
+; this file.
+;
+; In CI this file is NOT used directly: virtwho.ini is generated at
+; test time on tmpfs (/dev/shm/virtwho.ini, mode 0600) by
+; systemtest/scripts/generate-virtwho-ini.sh. The generator downloads
+; a sanitized base ini from VIRTWHO_INI_URL (a plain, non-secret
+; Testing Farm variable; the file holds non-secret values only) and
+; overlays the VIRTWHO_* environment variables delivered as CI secrets
+; (usernames, passwords, tokens, keytabs and SSH keys come ONLY from
+; there). When VIRTWHO_INI_URL is unset the complete ini is generated
+; from the VIRTWHO_* secrets alone. The test tree holds only a symlink
+; to the tmpfs file, and systemtest/scripts/cleanup-secrets.sh destroys
+; it in the tmt finish step. See README.rst for the environment
+; variable contract.
+;
+; When deriving a sanitized base ini from this sample, DELETE every
+; credential-shaped line (username/password/token/keytab/secret, key,
+; *_key). Blanking the value is NOT enough: the generator's filter
+; matches the option NAME regardless of value, so a blanked line
+; still aborts the run.
+;
 ; The section of [job] is used to define the testing hypervisor and subscription server
 ; hypervisor is an optional setting from esx/xen/hyperv/libvirt/rhevm/kubevirt/ahv/local, the default is 'esx'.
 ; register is an optional setting from rhsm/satellite, the default is 'rhsm'
+; rhel_compose is the compose id for the test, e.g. RHEL-10.0-20260101.0
+; rhel_compose_path is an optional override for the compose URL path
+; multi_hypervisors is an optional bracketed list for multi-hypervisor runs, e.g. [esx,rhevm]
 [job]
-hypervisor=
-register=
+hypervisor=esx
+register=rhsm
+rhel_compose=RHEL-10.0-20260101.0
+rhel_compose_path=http://download.example.com/rhel-10/nightly/RHEL-10
+multi_hypervisors=
 
 ; The section of [virtwho] is used to define the host information where virt-who package is installed and running
 ; host is a required option to indicate the ip address or hostname
 ; username and password are the required options to access the host
 ; port is an optional setting, the default port is 22
 ; repo is an optional setting, to indicate where is the virt-who yum repository
+; package is the virt-who NEVRA installed on the host (filled in by CI)
+; brew and test_rpms are optional settings for gating builds
 [virtwho]
-server=
-username=
-password=
-port=
-repo=
-proxy_server=
-proxy_port=
+server=virtwho.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+port=22
+repo=http://download.example.com/rhel/10/virt-who.repo
+package=virt-who-1.30.10-1.el10.noarch
+brew=http://brew.example.com/koji/taskinfo?taskID=0
+test_rpms=
+proxy_server=proxy.example.com
+proxy_port=3128
 
 ; The section of [rhsm] and [satellite] are used to define subscription servers
 ; server is a required option to indicate where to register
-; server=subscription.rhsm.redhat.com for product candlepin
-; server=subscription.rhsm.stage.redhat.com for stage candlepin
+; server=subscription.example.com for the candlepin server under test
 ; server should be the hostname or ip for satellite
 ; username and password are the required account options for registering
 ; prefix is an optional setting, the default prefix is /subscription for candlepin, /rhsm for satellite
@@ -30,26 +64,31 @@ proxy_port=
 ; default_org is a required option to indicate which org to register
 ; ssh_username/password are required options to access satellite host
 ; secondary_org and activation_key are optional settings for special case requirements
+; proxy_hostname/proxy_port are optional settings for a suite-level RHSM proxy
 [rhsm]
-server=
-username=
-password=
-prefix=
-port=
-default_org=
+server=subscription.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+prefix=/subscription
+port=443
+default_org=CHANGE_ME
 activation_key=
+proxy_hostname=proxy.example.com
+proxy_port=3128
 
 [satellite]
-server=
-username=
-password=
-prefix=
-port=
-ssh_username=
-ssh_password=
-default_org=
+server=satellite.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+prefix=/rhsm
+port=443
+ssh_username=CHANGE_ME
+ssh_password=CHANGE_ME
+default_org=CHANGE_ME
 secondary_org=
 activation_key=
+manifest=http://manifest.example.com/manifest.zip
+manifest_second=http://manifest.example.com/manifest-second.zip
 
 ; The below sections are used to define the different hypervisors information
 ; server, username and password are the required options to access esx/xen/hyperv/rhevm/libvirt/ahv and get mapping
@@ -59,137 +98,146 @@ activation_key=
 ; other options are optional settings based on special case requirements
 ; hypervisor-builder can help to get some information, like hypervisor_uuid/hwuuid/hostname/version/cpu/cluster, guest_ip/uuid/state
 [esx]
-server=
-username=
-password=
-ssh_username=
-ssh_password=
-esx_ip=
-esx_username=
-esx_password=
-esx_uuid=
-esx_hwuuid=
-esx_hostname=
-esx_version=
-esx_cpu=
-esx_cluster=
-guest_name=
-guest_ip=
-guest_username=
-guest_password=
-guest_uuid=
-guest_state=
+server=esx.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+ssh_username=CHANGE_ME
+ssh_password=CHANGE_ME
+ssh_ip=192.0.2.10
+esx_ip=192.0.2.10
+esx_username=CHANGE_ME
+esx_password=CHANGE_ME
+esx_uuid=00000000-0000-0000-0000-000000000000
+esx_hwuuid=00000000-0000-0000-0000-000000000000
+esx_hostname=esx.example.com
+esx_version=8.0.2
+esx_cpu=Intel(R) Xeon(R) CPU E5-2690 v4
+esx_cluster=CHANGE_ME
+guest_name=guest.example.invalid
+guest_ip=192.0.2.50
+guest_username=CHANGE_ME
+guest_password=CHANGE_ME
+guest_uuid=00000000-0000-0000-0000-000000000000
+guest_state=running
 
 ; server/username/password are used for basic auth (test_hyperv.py).
 ; kerberos_principal/kerberos_keytab_b64 are used for Kerberos auth
 ; (test_hyperv_kerberos.py), which the test suite enables itself by
-; setting auth_method=kerberos in the generated virt-who config. 
-; kerberos_keytab_b64 is a base64-encoded Kerberos keytab file which 
+; setting auth_method=kerberos in the generated virt-who config.
+; kerberos_keytab_b64 is a base64-encoded Kerberos keytab file which
 ; the suite decodes to a file on the virt-who host at test time.
 [hyperv]
-server=
-username=
-password=
-kerberos_principal=
-kerberos_keytab_b64=
-uuid=
-hostname=
-version=
-cpu=
-guest_name=
-guest_ip=
-guest_username=
-guest_password=
-guest_uuid=
-guest_state=
+server=hyperv.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+kerberos_principal=CHANGE_ME@EXAMPLE.COM
+kerberos_keytab_b64=CHANGE_ME
+uuid=00000000-0000-0000-0000-000000000000
+hostname=hyperv.example.com
+version=2019
+cpu=Intel(R) Xeon(R) CPU E5-2690 v4
+guest_name=guest.example.invalid
+guest_ip=192.0.2.50
+guest_username=CHANGE_ME
+guest_password=CHANGE_ME
+guest_uuid=00000000-0000-0000-0000-000000000000
+guest_state=running
 
 [rhevm]
-server=
-username=
-password=
-vdsm_uuid=
-vdsm_hwuuid=
-vdsm_hostname=
-vdsm_version=
-vdsm_cpu=
-vdsm_cluster=
-guest_name=
-guest_ip=
-guest_username=
-guest_password=
-guest_uuid=
-guest_state=
+server=rhevm.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+vdsm_uuid=00000000-0000-0000-0000-000000000000
+vdsm_hwuuid=00000000-0000-0000-0000-000000000000
+vdsm_hostname=rhevm.example.com
+vdsm_version=4.5.5
+vdsm_cpu=Intel(R) Xeon(R) CPU E5-2690 v4
+vdsm_cluster=CHANGE_ME
+guest_name=guest.example.invalid
+guest_ip=192.0.2.50
+guest_username=CHANGE_ME
+guest_password=CHANGE_ME
+guest_uuid=00000000-0000-0000-0000-000000000000
+guest_state=running
 
 [kubevirt]
-endpoint=
-token=
-config_file=
-uuid=
-hostname=
-version=
-cpu=
-guest_name=
-guest_ip=
-guest_port=
-guest_username=
-guest_password=
-guest_uuid=
-guest_state=
+endpoint=https://kubevirt.example.com:6443
+token=CHANGE_ME
+config_file=/root/kubeconfig
+config_file_no_cert=/root/kubeconfig-no-cert
+config_url=http://kubevirt.example.com/kubeconfig
+config_url_no_cert=http://kubevirt.example.com/kubeconfig-no-cert
+namespace=CHANGE_ME
+uuid=00000000-0000-0000-0000-000000000000
+hostname=kubevirt.example.com
+version=4.17.0
+cpu=Intel(R) Xeon(R) CPU E5-2690 v4
+guest_name=guest.example.invalid
+guest_ip=192.0.2.50
+guest_port=22
+guest_username=CHANGE_ME
+guest_password=CHANGE_ME
+guest_uuid=00000000-0000-0000-0000-000000000000
+guest_state=running
 
 [ahv]
-server=
-username=
-password=
-uuid=
-hostname=
-version=
-cpu=
-cluster=
-guest_name=
-guest_ip=
-guest_username=
-guest_password=
-guest_uuid=
-guest_state=
+server=ahv.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+uuid=00000000-0000-0000-0000-000000000000
+hostname=ahv.example.com
+version=AOS 6.7
+cpu=Intel(R) Xeon(R) CPU E5-2690 v4
+cluster=CHANGE_ME
+guest_name=guest.example.invalid
+guest_ip=192.0.2.50
+guest_username=CHANGE_ME
+guest_password=CHANGE_ME
+guest_uuid=00000000-0000-0000-0000-000000000000
+guest_state=running
 
 [libvirt]
-server=
-username=
-password=
-uuid=
-hostname=
-version=
-cpu=
-guest_name=
-guest_ip=
-guest_username=
-guest_password=
-guest_uuid=
-guest_state=
+server=libvirt.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+uuid=00000000-0000-0000-0000-000000000000
+hostname=libvirt.example.com
+version=10.0.0
+cpu=Intel(R) Xeon(R) CPU E5-2690 v4
+guest_name=guest.example.invalid
+guest_ip=192.0.2.50
+guest_username=CHANGE_ME
+guest_password=CHANGE_ME
+guest_uuid=00000000-0000-0000-0000-000000000000
+guest_state=running
 
 [local]
-server=
-username=
-password=
-port=
-guest_name=
-guest_ip=
-guest_username=
-guest_password=
-guest_uuid=
-guest_state=
+server=localhost
+username=CHANGE_ME
+password=CHANGE_ME
+port=22
+guest_name=guest.example.invalid
+guest_ip=192.0.2.50
+guest_username=CHANGE_ME
+guest_password=CHANGE_ME
+guest_uuid=00000000-0000-0000-0000-000000000000
+guest_state=running
+guest_image_path=/var/lib/libvirt/images/guest.qcow2
+guest_image_url=http://download.example.com/images/guest.qcow2
+guest_xml_path=/var/lib/libvirt/qemu/guest.xml
+guest_xml_url=http://download.example.com/images/guest.xml
 
 [xen]
-server=
-username=
-password=
-uuid=
-hostname=
-version=
-cpu=
-guest_name=
-guest_ip=
-guest_username=
-guest_password=
-guest_uuid=
-guest_state=
+server=xen.example.com
+username=CHANGE_ME
+password=CHANGE_ME
+uuid=00000000-0000-0000-0000-000000000000
+hostname=xen.example.com
+version=7.6
+cpu=Intel(R) Xeon(R) CPU E5-2690 v4
+guest_name=guest.example.invalid
+guest_ip=192.0.2.50
+guest_username=CHANGE_ME
+guest_password=CHANGE_ME
+guest_uuid=00000000-0000-0000-0000-000000000000
+guest_state=running
