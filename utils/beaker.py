@@ -283,7 +283,7 @@ def beaker_arguments_parser():
         required=False,
         default=None,
         help="Define/filter system as hostrequire. "
-        "Such as: %%ent-02-vm%%, ent-02-vm-20.lab.eng.nay.redhat.com",
+        "Such as: %%guest-01-vm%%, guest-01-vm-05.example.invalid",
     )
     parser.add_argument(
         "--host-require",

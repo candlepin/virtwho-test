@@ -14,22 +14,26 @@
 set -euo pipefail
 
 # Parse host and port from the environment proxy URL (set by the TMT plan
-# environment block in regression.fmf).  Accepts formats: http://host:port,
-# host:port, host.  Falls back to squid.corp.redhat.com:3128 for manual /
-# non-TMT invocations so the script remains usable standalone.
+# environment block in regression.fmf or by CI).  Accepts formats:
+# http://host:port, host:port, host.  There is no default: without
+# HTTPS_PROXY/HTTP_PROXY the proxy configuration is skipped with a
+# warning -- set the variables for environments that need a proxy to
+# reach the subscription server.
 _proxy_url="${HTTPS_PROXY:-${HTTP_PROXY:-}}"
+PROXY_HOST=""
+PROXY_PORT=""
 if [ -z "$_proxy_url" ]; then
-    echo "INFO: HTTPS_PROXY/HTTP_PROXY not set; using default squid.corp.redhat.com:3128"
-    _proxy_url="http://squid.corp.redhat.com:3128"
+    echo "WARNING: HTTPS_PROXY/HTTP_PROXY not set; skipping subscription-manager proxy configuration"
+else
+    # Strip protocol prefix and trailing slash
+    _hostport="${_proxy_url#http://}"
+    _hostport="${_hostport#https://}"
+    _hostport="${_hostport%/}"
+    PROXY_HOST="${_hostport%%:*}"
+    PROXY_PORT="${_hostport##*:}"
+    # If no port was in the string, default to 3128
+    [ "$PROXY_PORT" = "$PROXY_HOST" ] && PROXY_PORT=3128
 fi
-# Strip protocol prefix and trailing slash
-_hostport="${_proxy_url#http://}"
-_hostport="${_hostport#https://}"
-_hostport="${_hostport%/}"
-PROXY_HOST="${_hostport%%:*}"
-PROXY_PORT="${_hostport##*:}"
-# If no port was in the string, default to 3128
-[ "$PROXY_PORT" = "$PROXY_HOST" ] && PROXY_PORT=3128
 
 if [ "${REGISTER:-rhsm}" = "rhsm" ] && [ -n "${PROXY_HOST:-}" ]; then
     if command -v subscription-manager &>/dev/null; then

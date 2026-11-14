@@ -22,16 +22,29 @@ ini_get() {
     awk -F= "/^\[kubevirt\]/{f=1;next} /^\[/{f=0} f&&/^${1}=/{print \$2}" virtwho.ini | tr -d ' '
 }
 
-# Inject the real SA token (passed via KUBEVIRT_TOKEN env var from Jenkins).
+# Inject the real SA token (passed via the VIRTWHO_KUBEVIRT_TOKEN secret
+# or the legacy KUBEVIRT_TOKEN env var).
 # Uses configparser to safely write the token value without corrupting subsequent lines.
+# The token is passed via the environment (not argv) so it does not appear
+# in /proc/<pid>/cmdline. Discovered (non-secret) guest coordinates are
+# also recorded in the .virtwho-computed.ini sidecar for the run-tests.sh
+# merge: run-tests.sh regenerates the ini on tmpfs at test time, and on
+# bootc the prepare-phase tmpfs content does not survive the container
+# build. The token itself is never written to the sidecar.
+KUBEVIRT_TOKEN=${KUBEVIRT_TOKEN:-${VIRTWHO_KUBEVIRT_TOKEN:-}}
 if [ -n "${KUBEVIRT_TOKEN:-}" ]; then
-    python3 -c "
-import configparser, json, re, socket, ssl, sys, urllib3
+    KUBEVIRT_TOKEN="$KUBEVIRT_TOKEN" python3 -c "
+import configparser, json, os, re, socket, ssl, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-token = sys.argv[1]
+token = os.environ['KUBEVIRT_TOKEN']
 cfg = configparser.ConfigParser(interpolation=None)
 cfg.optionxform = str
 cfg.read('virtwho.ini')
+sc = configparser.ConfigParser(interpolation=None)
+sc.optionxform = str
+sc.read('.virtwho-computed.ini')
+if not sc.has_section('kubevirt'):
+    sc.add_section('kubevirt')
 if 'kubevirt' in cfg:
     cfg['kubevirt']['token'] = token
     endpoint = cfg['kubevirt'].get('endpoint')
@@ -90,6 +103,7 @@ if 'kubevirt' in cfg:
 
                 if discovered_ip:
                     cfg['kubevirt']['guest_ip'] = discovered_ip
+                    sc['kubevirt']['guest_ip'] = discovered_ip
                     print(f'Discovered guest_ip: {discovered_ip} (node: {node_name})')
                 else:
                     print(f'Warning: could not determine guest_ip from node: {node_name}')
@@ -109,15 +123,18 @@ if 'kubevirt' in cfg:
                 node_port = svc.get('spec', {}).get('ports', [{}])[0].get('nodePort')
                 if node_port:
                     cfg['kubevirt']['guest_port'] = str(node_port)
+                    sc['kubevirt']['guest_port'] = str(node_port)
                     print(f'Discovered guest_port: {node_port}')
         except Exception as e:
             print(f'Warning: guest_port discovery failed: {e}')
 
     with open('virtwho.ini', 'w') as f:
         cfg.write(f, space_around_delimiters=False)
+    with open('.virtwho-computed.ini', 'w') as f:
+        sc.write(f, space_around_delimiters=False)
 else:
     print('Warning: [kubevirt] section not found in virtwho.ini; skipping token injection')
-" "$KUBEVIRT_TOKEN"
+"
     echo "Injected KUBEVIRT_TOKEN and updated dynamic coordinates in virtwho.ini"
 fi
 
@@ -126,42 +143,81 @@ KV_TOKEN=$(ini_get token)
 KV_CONFIG_FILE=$(ini_get config_file)
 KV_CONFIG_NO_CERT=$(ini_get config_file_no_cert)
 
-# Generate kubeconfig YAML from SA token
+# Generate kubeconfig YAML from SA token (token passed via the
+# environment, not argv, to keep it out of /proc/<pid>/cmdline). The
+# kubeconfig contains the token, so it is created 0600 from the start
+# and shredded by cleanup-secrets.sh in the tmt finish step.
+# On kubevirt image-mode (bootc) runs the prepare phase may run
+# without a writable /root: gate the write on an explicit writability
+# test of the target directory and skip with a clear message when it
+# fails -- the kubevirt tests then cannot run with a kubeconfig
+# (review PR297-04; this implements the README claim).
 if [ -n "$KV_ENDPOINT" ] && [ -n "$KV_TOKEN" ] && [ -n "$KV_CONFIG_FILE" ]; then
-    echo "Generating kubeconfig at $KV_CONFIG_FILE for $KV_ENDPOINT"
-    python3 -c "
-import yaml, sys
+    KV_CONFIG_DIR=$(dirname -- "$KV_CONFIG_FILE")
+    if [ ! -w "$KV_CONFIG_DIR" ]; then
+        echo "WARNING: ${KV_CONFIG_DIR} is not writable (kubevirt image-mode/bootc runs prepare without a writable /root); skipping kubeconfig generation at ${KV_CONFIG_FILE} -- the kubevirt tests cannot run with a kubeconfig"
+    else
+        echo "Generating kubeconfig at $KV_CONFIG_FILE for $KV_ENDPOINT"
+        KUBEVIRT_TOKEN="$KV_TOKEN" python3 -c "
+import os, sys, yaml
 kc = {
     'apiVersion': 'v1', 'kind': 'Config',
     'clusters': [{'cluster': {'server': sys.argv[1], 'insecure-skip-tls-verify': True}, 'name': 'kubevirt'}],
     'contexts': [{'context': {'cluster': 'kubevirt', 'user': 'ci-runner'}, 'name': 'kubevirt'}],
     'current-context': 'kubevirt',
-    'users': [{'name': 'ci-runner', 'user': {'token': sys.argv[2]}}],
+    'users': [{'name': 'ci-runner', 'user': {'token': os.environ['KUBEVIRT_TOKEN']}}],
 }
-with open(sys.argv[3], 'w') as f:
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+# os.open's mode only applies when O_CREAT creates the file; force
+# 0600 regardless of any pre-existing file's mode (review PR297-11).
+os.fchmod(fd, 0o600)
+with os.fdopen(fd, 'w') as f:
     yaml.safe_dump(kc, f, default_flow_style=False)
-" "$KV_ENDPOINT" "$KV_TOKEN" "$KV_CONFIG_FILE"
-    echo "Kubeconfig written ($(wc -c < "$KV_CONFIG_FILE") bytes)"
+" "$KV_ENDPOINT" "$KV_CONFIG_FILE"
+        echo "Kubeconfig written ($(wc -c < "$KV_CONFIG_FILE") bytes, mode 0600)"
 
-    if [ -n "$KV_CONFIG_NO_CERT" ]; then
-        cp "$KV_CONFIG_FILE" "$KV_CONFIG_NO_CERT"
-        echo "No-cert kubeconfig written to $KV_CONFIG_NO_CERT"
+        if [ -n "$KV_CONFIG_NO_CERT" ]; then
+            KV_NOCERT_DIR=$(dirname -- "$KV_CONFIG_NO_CERT")
+            if [ -w "$KV_NOCERT_DIR" ]; then
+                install -m 600 "$KV_CONFIG_FILE" "$KV_CONFIG_NO_CERT"
+                echo "No-cert kubeconfig written to $KV_CONFIG_NO_CERT (mode 0600)"
+            else
+                echo "WARNING: ${KV_NOCERT_DIR} is not writable; skipping the no-cert kubeconfig copy"
+            fi
+        fi
     fi
 fi
 
 # Configure proxy on the KubeVirt guest VM so subscription-manager
-# can reach stage.  The guest is inside ITUP and has no direct route
-# to subscription.rhsm.stage.redhat.com.
+# can reach the subscription server. The guest is inside the cluster
+# network and has no direct route out. The proxy comes from the
+# HTTPS_PROXY / HTTP_PROXY environment variables (the same contract as
+# configure-proxy.sh); there is no default -- without the variables the
+# configuration is skipped.
 KV_GUEST_IP=$(ini_get guest_ip)
 KV_GUEST_PORT=$(ini_get guest_port)
 KV_GUEST_USER=$(ini_get guest_username)
 KV_GUEST_PASS=$(ini_get guest_password)
 if [ -n "$KV_GUEST_IP" ] && [ -n "$KV_GUEST_PORT" ]; then
-    echo "Configuring proxy on KubeVirt guest VM at ${KV_GUEST_IP}:${KV_GUEST_PORT}"
-    sshpass -p "${KV_GUEST_PASS:-redhat}" \
-        ssh -o StrictHostKeyChecking=no -p "$KV_GUEST_PORT" \
-        "${KV_GUEST_USER:-root}@${KV_GUEST_IP}" \
-        "subscription-manager config --server.proxy_hostname=squid.corp.redhat.com --server.proxy_port=3128" \
-        && echo "Guest VM proxy configured" \
-        || echo "WARNING: Failed to configure guest VM proxy"
+    _proxy_url="${HTTPS_PROXY:-${HTTP_PROXY:-}}"
+    if [ -z "$_proxy_url" ]; then
+        echo "WARNING: HTTPS_PROXY/HTTP_PROXY not set; skipping guest VM proxy configuration"
+    else
+        _hostport="${_proxy_url#http://}"
+        _hostport="${_hostport#https://}"
+        _hostport="${_hostport%/}"
+        PROXY_HOST="${_hostport%%:*}"
+        PROXY_PORT="${_hostport##*:}"
+        # If no port was in the string, default to 3128
+        [ "$PROXY_PORT" = "$PROXY_HOST" ] && PROXY_PORT=3128
+        echo "Configuring proxy on KubeVirt guest VM at ${KV_GUEST_IP}:${KV_GUEST_PORT}"
+        # sshpass -e with SSHPASS set only for this command keeps the
+        # password off the process list (/proc/*/cmdline).
+        SSHPASS="${KV_GUEST_PASS:-redhat}" sshpass -e \
+            ssh -o StrictHostKeyChecking=no -p "$KV_GUEST_PORT" \
+            "${KV_GUEST_USER:-root}@${KV_GUEST_IP}" \
+            "subscription-manager config --server.proxy_hostname=${PROXY_HOST} --server.proxy_port=${PROXY_PORT}" \
+            && echo "Guest VM proxy configured" \
+            || echo "WARNING: Failed to configure guest VM proxy"
+    fi
 fi
