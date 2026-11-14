@@ -404,7 +404,7 @@ def virtwho_arguments_parser():
         "--rhel-compose-path",
         required=False,
         default=config.job.rhel_compose_path,
-        help="Such as http://download.devel.redhat.com/rhel-9/nightly/RHEL-9. "
+        help="Such as http://download.example.com/rhel-9/nightly/RHEL-9. "
         "If leave it None, will use the specified path in code.",
     )
     parser.add_argument(

@@ -6,7 +6,12 @@ import shlex
 import string
 import time
 
-from virtwho import FailException, logger
+from virtwho import (
+    TEST_RPMS,
+    VIRTWHO_UNDERTEST_RPM,
+    FailException,
+    logger,
+)
 from virtwho.settings import config
 
 
@@ -429,6 +434,102 @@ def dnf_can_downgrade(ssh, pkg_name):
     return any(v != installed for v in versions)
 
 
+def virtwho_install_under_test(ssh):
+    """Install virt-who's VERSION UNDER TEST.
+
+    Precedence: TEST_RPMS first (manual overrides, PR-build testing,
+    gated release builds -- the URL list the cct-gate pipeline
+    delivers), else the compose-provided RPM cached by
+    setup-virtwho-test.sh at prepare time (BEFORE any registration
+    could switch the host's content sources), else -- the hand-run
+    local-suite shape only -- the enabled repos. The destination's
+    content repo is NEVER the intended source: the container tier's
+    registered host gets its content from the pod, which does not
+    serve virt-who packages. The file/URL installs disable every repo
+    so a broken destination repo cannot even break the metadata
+    refresh; the dependencies of the just-removed package are still
+    installed, which is all the resolution needs.
+
+    :param ssh: ssh access of testing host
+    """
+    if TEST_RPMS:
+        cmd = f"dnf -y install --allowerasing --disablerepo='*' {TEST_RPMS}"
+    elif VIRTWHO_UNDERTEST_RPM:
+        cmd = (
+            f"dnf -y install --allowerasing --disablerepo='*' "
+            f"{VIRTWHO_UNDERTEST_RPM}"
+        )
+    else:
+        cmd = "dnf -y install --allowerasing virt-who"
+    ssh.runcmd(cmd)
+    if package_check(ssh, "virt-who") is False:
+        raise FailException(
+            "Failed to install the virt-who version under test"
+        )
+
+
+def virtwho_download_under_test(ssh, dest_dir):
+    """Fetch the virt-who VERSION UNDER TEST as an rpm FILE.
+
+    The by-rpm install/uninstall test needs the rpm as a file; the
+    source precedence mirrors virtwho_install_under_test(): the
+    TEST_RPMS URL list first (gating mode -- including the shape
+    where the prepare-phase cache could not be written), else the
+    prepare-phase undertest cache (it holds the TEST_RPMS rpm in
+    gating mode, the compose's own virt-who otherwise -- never the
+    destination's content repo), else -- the hand-run local suite
+    shape only, where neither exists -- the enabled repos. The
+    registered container-tier host's only enabled repo is the pod's
+    dead content repo, so the repo download must never be the
+    primary path.
+
+    :param ssh: ssh access of testing host
+    :param dest_dir: the guest-local directory to place the rpm in
+    :return: the guest-local path of the rpm file
+    """
+    if TEST_RPMS:
+        # the virt-who rpm of the URL list (the same selection the
+        # prepare-phase cache makes); a gating list without one
+        # cannot source the by-rpm test -- fail loudly, never fall
+        # through to the enabled repos
+        url = next(
+            (u for u in TEST_RPMS.split()
+             if u.rstrip("/").rsplit("/", 1)[-1].startswith("virt-who-")
+             and u.endswith(".rpm")),
+            "",
+        )
+        if not url:
+            raise FailException(
+                "TEST_RPMS carries no virt-who RPM URL to download"
+            )
+        name = url.rstrip("/").rsplit("/", 1)[-1]
+        ssh.runcmd(f"mkdir -p {dest_dir}")
+        ret, _output = ssh.runcmd(
+            f"curl -fsSL --retry 3 --retry-delay 5 "
+            f"--connect-timeout 10 --max-time 300 "
+            f"-o {dest_dir}/{name} {url}"
+        )
+        if ret != 0:
+            raise FailException(
+                "Failed to download the virt-who version-under-test "
+                f"RPM from {url}"
+            )
+        return f"{dest_dir}/{name}"
+    if VIRTWHO_UNDERTEST_RPM:
+        ssh.runcmd(f"mkdir -p {dest_dir}")
+        ret, _output = ssh.runcmd(
+            f"cp -f {VIRTWHO_UNDERTEST_RPM} {dest_dir}/"
+        )
+        if ret != 0:
+            raise FailException(
+                "Failed to copy the virt-who version-under-test RPM "
+                f"from {VIRTWHO_UNDERTEST_RPM}"
+            )
+        name = VIRTWHO_UNDERTEST_RPM.rstrip("/").rsplit("/", 1)[-1]
+        return f"{dest_dir}/{name}"
+    return dnf_download_pkg(ssh, "virt-who", dest_dir)
+
+
 def package_install(ssh, pkg_name, rpm=None):
     """
     Install a package by yum or rpm
@@ -444,18 +545,30 @@ def package_install(ssh, pkg_name, rpm=None):
         raise FailException(f"Failed to install {pkg_name}")
 
 
-def package_uninstall(ssh, pkg_name, rpm=False):
+def package_uninstall(ssh, pkg_name, rpm=False, keep_deps=False):
     """
     Uninstall a package by yum or rpm
     :param ssh: ssh access of testing host
     :param pkg_name: package name, such as virt-who
     :param rpm: rpm path, such as /root/virt-who-1.31.23-1.el9.noarch.rpm
+    :param keep_deps: leave the automatically-installed dependencies
+        in place (dnf's clean_requirements_on_remove disabled) --
+        needed by the by-dnf install/uninstall test path, whose
+        reinstall runs with every repo disabled: dnf5 removes
+        auto-installed dependencies together with the package, and
+        the repo-less reinstall could then no longer resolve them.
+        The default keeps the plain command for every other consumer.
     """
     cmd = f"yum remove -y {pkg_name}"
+    if keep_deps:
+        cmd = (
+            f"yum remove -y --setopt=clean_requirements_on_remove=False "
+            f"{pkg_name}"
+        )
     if rpm:
         cmd = f"rpm -e {rpm} --nodeps"
     ssh.runcmd(cmd)
-    if package_check(ssh, pkg_name) is True:
+    if package_check(ssh, pkg_name) is not False:
         raise FailException(f"Failed to uninstall {pkg_name}")
 
 
@@ -790,7 +903,7 @@ def system_reboot(ssh):
 
 def virtwho_package_url(pkg, rhel_compose_id, rhel_compose_path=""):
     """
-    Get the virt-who package url from http://download.devel.redhat.com/
+    Get the virt-who package url from http://download.example.com/
     for downloading.
     :param pkg: virt-who package, such as virt-who-1.31.26-1.el9.noarch
     :param rhel_compose_id: rhel compose id

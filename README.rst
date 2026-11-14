@@ -77,7 +77,17 @@ How the ini is assembled:
    compose, the virt-who NEVRA, gating ``test_rpms``, the kubevirt
    guest coordinates) are recorded in the non-secret sidecar
    ``.virtwho-computed.ini`` and merged back by ``run-tests.sh`` when
-   it regenerates the ini at test time.
+   it regenerates the ini at test time. The version-under-test
+   values (the virt-who NEVRA, ``test_rpms``, the undertest RPM
+   cache path) and the resolved compose **override** the base ini:
+   they are computed ground truth about what the run tests, while
+   the base ini is the statically published ``VIRTWHO_INI_URL``
+   file whose values can lag the compose actually under test (the
+   run-#9 regression: a stale base-ini NEVRA silently beat the
+   computed value under empty-only fallback semantics). When the
+   sidecar carries no value (hand-run local shapes) the base ini's
+   own value stands; credentials keep the empty-only fallback --
+   the sidecar holds no credentials by construction.
 
 CI supply (outside this repository): ``VIRTWHO_INI_URL`` is delivered
 as a *plain* request-time variable by the rhsm-jobs virt-who
@@ -125,7 +135,7 @@ The invariant is enforced, not just documented: the generator
 resolves a symlinked output path and writes through to the target
 (never replacing the link with a regular file), and the finish step
 shreds a regular legacy ``virtwho.ini`` found in a tree before
-unlinking it. Three disk exceptions exist and are destroyed by the
+unlinking it. Four disk exceptions exist and are destroyed by the
 finish step: the kubevirt kubeconfigs (below), the suite's own
 artifacts under the tree's ``temp/`` directory --
 ``VirtwhoHypervisorConfig`` writes ``temp/<mode>.conf`` (it carries
@@ -138,7 +148,17 @@ the per-mode configs uploaded to ``/etc/virt-who.d/``:
 ``[virtwho] server`` to the guest's own address, so the upload lands
 on the same machine the finish step runs on) carrying the same
 hypervisor and register passwords, and the Hyper-V keytab twin is
-uploaded to the same directory; all are shredded by the finish step.
+uploaded to the same directory -- and the copies the suite's
+*tests* write themselves, wherever they land (provenance, not
+location, is what makes them exceptions):
+``tests/function/test_cli.py`` copies the per-mode config to
+``/root/test_cli_config.conf`` (to exercise ``virt-who -c``), the
+tests leave suffixed/hidden variants in ``/etc/virt-who.d/``
+(``esx.conf.txt``, ``.test.conf.swp``), and the upgrade tests
+(``tests/upgrade/test_upgrade.py``) pull the per-mode configs and
+``/etc/virt-who.conf`` onto ``/tmp`` (``<mode>.conf.pre``/``.post``,
+``virt-who.conf.pre``/``.post``) to compare them across the upgrade;
+all are shredded by the finish step.
 
 The SSH key for the libvirt hypervisor is injected as
 ``CCT_SSH_KEY_B64`` (base64); it is decoded to
@@ -156,7 +176,12 @@ The kubevirt service-account token is the one credential that touches
 real disk: the virt-who daemon reads its kubeconfig from fixed paths,
 so ``prepare-kubevirt.sh`` writes ``/root/kubeconfig`` and
 ``/root/kubeconfig-no-cert`` mode 0600, and ``cleanup-secrets.sh``
-shreds both files in the tmt finish step. The shred path follows the
+shreds both files in the tmt finish step. The write is confined the
+same way as the shred: ``prepare-kubevirt.sh`` refuses to write a
+kubeconfig (or the no-cert copy) to any path that is not an absolute
+path canonicalized under ``/root``, with a warning naming the refused
+path -- the token is never created somewhere the finish step would
+not shred it. The shred path follows the
 ini: the finish step reads ``[kubevirt]`` ``config_file`` /
 ``config_file_no_cert`` from the ini while it is still readable
 (falling back per-option to the two literals, which are also the
@@ -166,6 +191,30 @@ that is not an absolute path under ``/root`` is *refused* with a
 warning instead of shredded -- the ini is downloaded input and must
 not aim the finish step at arbitrary files. The ini and the SSH key,
 by contrast, are tmpfs-only.
+
+Per-run guest-IP discovery (ahv/hyperv/libvirt): the guests inside
+these hypervisors receive DHCP addresses, so a static ``guest_ip`` in
+the base ini goes stale. Before the suite starts, ``run-tests.sh``
+calls ``systemtest/scripts/discover-guest-ips.sh``, which asks the
+hypervisor itself for the guest's current address (``virsh domifaddr``
+over ssh for libvirt, PowerShell ``Get-VMNetworkAdapter`` over ssh for
+hyperv, the Prism REST API for ahv) and patches ``guest_ip`` in the
+tmpfs ini. The ini is downloaded, untrusted input on this path too:
+its values are data, never code -- the guest name travels to the
+libvirt/hyperv hypervisors through ssh's stdin behind a fixed command
+string and is percent-encoded for the ahv query, so a quote in an ini
+value cannot become remote code. Discovery needs ``server``,
+``username`` and ``guest_name`` in the active hypervisor's ini
+section; when any is absent the script skips with a warning and the
+static ``guest_ip`` stands (a missing ini file is the only hard
+error). A failed discovery is only a warning: the ini value is kept
+as the fallback. Only the IP is written back, never credentials --
+and when the discovered address differs from a non-empty ini value,
+the overwrite is logged as a WARNING naming both values (on a
+multi-NIC guest the management plane may report a different NIC
+first). ``VIRTWHO_SKIP_IP_DISCOVERY=1`` disables the discovery
+entirely for labs with a known-good static ``guest_ip`` (the ini
+value is kept and the skip is logged).
 
 Environment variable contract (all optional; option names are
 lower-cased into the ini, e.g. ``VIRTWHO_ESX_GUEST_IP`` -> ``guest_ip``
@@ -232,15 +281,140 @@ Notes:
 * ``VIRTWHO_REPO`` (optional) enables nightly compose alias resolution
   in ``setup-virtwho-test.sh``; there is no default. ``HTTPS_PROXY`` /
   ``HTTP_PROXY`` configure the subscription-manager proxy
-  (``configure-proxy.sh`` and the kubevirt guest); there is no default
-  either. Both are delivered as plain request-time variables by the
-  rhsm-jobs virt-who pipelines (follow-up MR !560, merged 2026-11-19);
-  the in-repo internal defaults stay removed.
+  (``configure-proxy.sh`` and the kubevirt guest) for the **stage**
+  tier only; there is no default either. Both are delivered as plain
+  request-time variables by the rhsm-jobs virt-who pipelines
+  (follow-up MR !560, merged 2026-11-19); the in-repo internal
+  defaults stay removed. Proxy scoping in the **container** tier
+  (the default): every pod-facing connection bypasses the proxy --
+  the prepare script's curls carry ``--noproxy`` per command, the
+  suite's process environment gains ``no_proxy`` for the pod hosts
+  (``localhost,127.0.0.1,candlepin``) before pytest, and
+  ``configure-proxy.sh`` / ``prepare-kubevirt.sh`` skip their
+  subscription-manager proxy configuration entirely -- because the
+  proxy can never route the guest's own pod ports, while external
+  egress (the image pulls) keeps riding it.
+* ``TEST_RPMS`` (optional, plain non-secret) is the virt-who RPM URL
+  list the rhsm-jobs pipelines deliver as a request-time Testing
+  Farm variable after parsing Brew UMB messages (the dist-git OSCI
+  gating plan uses the same flow). It carries the **version under
+  test** with strict precedence (owner ruling, 2026-11-21): when
+  set, it always wins -- manual overrides, PR-build testing, gated
+  release builds; when empty, the version under test is the RHEL
+  compose's *own* virt-who. In both cases the prepare phase installs
+  it before any test starts (``install-deps.sh``: ``dnf install`` of
+  the ``TEST_RPMS`` URLs, else of the compose's virt-who), and
+  ``setup-virtwho-test.sh`` additionally caches the same RPM as a
+  file (``virt-who-under-test.rpm`` in the test tree, recorded as
+  ``[virtwho] undertest_rpm`` through the computed sidecar) so the
+  package tests can reinstall and inspect it with every dnf repo
+  disabled. The package under test must NEVER come from the
+  destination's content repo: a registered container-tier host gets
+  its content from the pod, which serves no virt-who packages (the
+  run-#7 regression class).
+* ``VIRTWHO_TEST_REPO`` / ``VIRTWHO_TEST_BRANCH`` (optional, plain
+  non-secret) select what ``setup-virtwho-test.sh`` shallow-clones for
+  the execute phase (default: the public ``virtwho-test`` repository's
+  ``main``). Cross-tree contract: the cloned tree is what actually
+  runs the suite, so it must carry the conftest destination logic of
+  the branch under test -- when testing destination features, point
+  ``VIRTWHO_TEST_BRANCH`` at a branch that has them (a mismatch runs
+  the destination-coupled tests unguarded on the old contract).
+* ``VIRTWHO_DESTINATION`` (optional, plain non-secret) selects the
+  ``[rhsm]`` destination tier. ``container`` (the **default**) is
+  the hermetic CI tier of CCT-3155: the generator fills ``[rhsm]``
+  with the SYNTHETIC values of the checked-in
+  ``systemtest/config/virtwho-container.ini`` (public-by-design test
+  data baked into the digest-pinned ``ghcr.io/candlepin`` images --
+  not sentinels, not env secrets, nothing to shred), the base's
+  ``[rhsm]`` sentinels are neither resolved nor kept, the baseurl
+  points at the deliberately-unbound local port
+  (``http://localhost:8080`` -- the pod carries no repo container:
+  virt-who tests virt-who's *reporting*, not content consumption, so
+  content access stays local with no CDN fallback and no external
+  egress, and every content operation against it fails locally and
+  bounded; registration is unaffected -- proven live with a full
+  ``subscription-manager register`` round-trip while nothing served
+  the content URL), ``VIRTWHO_RHSM_*`` env secrets do
+  **not** overlay the section (stale stage secrets from an old
+  pipeline are ignored with a warning), and no Vault wiring is
+  needed at all. The pod itself is deployed per run by
+  ``prepare-candlepin.sh`` (tmt prepare, AFTER the clone step -- the
+  marker lands in the cloned tree's root;
+  ``podman play kube`` of ``systemtest/config/candlepin-pod.yaml``,
+  CA trust and the ``candlepin`` hosts entry included). When the
+  tier is selected but the pod is absent, the contract is two-layer:
+  on a standard (non-bootc) run, ``run-tests.sh`` invokes
+  ``systemtest/scripts/assert-candlepin-tier.sh`` before pytest and
+  the missing ``.virtwho-candlepin-ready`` marker **fails the run
+  outright** (a broken tier is a red run, never green-with-skips);
+  the per-test skip in ``tests/conftest.py`` remains as
+  defense-in-depth for the contexts that legitimately have no
+  runtime podman (bootc container-build prepare contexts, hand
+  written inis without a ``[job] destination`` record).
+  ``stage`` restores the sentinel flow
+  unchanged for the scheduled fidelity tier (``[job]`` records the
+  selection in ``destination``). Known limits of the container tier:
+  the kubevirt guest VMs register against the ini's
+  ``server=candlepin``, which only resolves on the test guest
+  itself -- guest-side registration from inside the OCP cluster
+  needs the demonstrator cell's networking to route to the test
+  guest's published 8443 port; a remote guest that can route to the
+  pod host but does not trust its CA skips the guest-coupled tests
+  with a reason that names the trust gap (the probe is two-stage:
+  verified TLS first, ``-k`` only to classify the failure); and the
+  pre-baked data is synthetic, so tests needing real entitlement
+  content cannot run container tier (none do in the default path
+  today).
+* ``VIRTWHO_CP_APP_IMAGE`` / ``VIRTWHO_CP_DB_IMAGE`` (optional,
+  plain non-secret) override the digest-pinned candlepin image refs
+  of ``prepare-candlepin.sh`` (e.g. to test a refresh before
+  repinning); the vendored ``systemtest/config/candlepin-pod.yaml``
+  stays the canonical pin record. Refresh the digests deliberately,
+  in both places, and note the date in the yaml header. The pod is
+  two containers (app + db) since the run-#7 follow-up: there is no
+  repo container and no ``VIRTWHO_CP_REPO_IMAGE`` knob -- nothing in
+  the suite consumes content from the destination.
+* ``VIRTWHO_SQUID_IMAGE`` (optional, plain non-secret variable) names
+  the container image the bad-proxy tests run
+  (``tests/conftest.py`` and the two pre-pull hooks); there is no
+  default -- the bad-proxy tests skip with a warning when it is unset,
+  so pipelines that run them must deliver it.
+* ``VIRTWHO_VIRTWHO_PASSWORD`` (secret) sets the root password of the
+  guest the suite itself logs into (the virt-who host IS this guest,
+  so ``run-tests.sh`` sets the account's password from it); when
+  unset, a random per-run password is generated instead -- there is
+  no default, so nothing published can log in as root on a suite
+  guest.
+* ``VIRTWHO_KUBEVIRT_GUEST_PASSWORD`` (secret) delivers ``[kubevirt]``
+  ``guest_password`` through the ``VIRTWHO_KUBEVIRT_*`` overlay above;
+  when unset or left as an unresolved ``@vault:`` sentinel,
+  ``prepare-kubevirt.sh`` warns and skips the guest VM proxy
+  configuration -- there is no default.
+* ``VIRTWHO_KUBECONFIG_ROOT`` (optional) is the single kubeconfig
+  confinement root shared by the write side
+  (``prepare-kubevirt.sh``) and the finish-step shred
+  (``cleanup-secrets.sh``); default ``/root``. Setting it moves both
+  gates together -- a kubeconfig can never be written somewhere the
+  finish step would refuse to shred it. ``VIRTWHO_CLEANUP_KUBECONFIGS``
+  is the trusted explicit-list override for the shred side: paths
+  named there are destroyed wherever they live, bypassing the
+  confinement check (operator-supplied, e.g. by a CI job -- never
+  derived from the downloaded ini).
+* ``VIRTWHO_SKIP_IP_DISCOVERY=1`` (optional) disables the per-run
+  guest-IP discovery above: the ini's existing ``guest_ip`` is kept
+  and the skip is logged. For labs with a known-good static
+  ``guest_ip`` (e.g. multi-NIC guests whose management plane reports
+  a different NIC first).
 * Known limitations: on kubevirt image-mode (bootc) runs the
   kubeconfig write is skipped when the target directory is not
   writable (``prepare-kubevirt.sh`` tests writability explicitly and
   says so -- the prepare phase runs without a writable ``/root``);
-  the kubevirt tests then cannot run with a kubeconfig. The
+  the kubevirt tests then cannot run with a kubeconfig. In the
+  container destination tier, guests that cannot reach or trust the
+  per-run Candlepin pod skip the guest-coupled tests with a reason
+  naming the limitation (trust distribution to routable guests is
+  the documented follow-up). The
   ``[beaker]`` and ``[gating]`` ini sections are not covered by the
   ``VIRTWHO_*`` generator in env-only fallback mode (the sanitized base
   file can provide them). The ``rhsm_sw`` register path
@@ -276,11 +450,9 @@ Environment variable                 Purpose
 ``VIRTWHO_INI_URL`` itself is a *plain* (non-secret) Testing Farm
 variable.
 
-Self-test for the generator and the tmpfs/symlink/ssh_config plumbing
-(no real credentials involved; runs on every push and pull request in
-the ``Lint`` workflow's ``selftest`` job, and can be run manually)::
-
-    bash systemtest/scripts/test-generate-virtwho-ini.sh
+The host-side self-tests for the generator/tmpfs plumbing and the
+guest-IP discovery live on the companion branch ``cct-3162/selftests``
+(stacked on this branch; merged immediately after it).
 
 .. _virtwho-test: https://github.com/candlepin/virtwho-test
 .. _Eko: https://github.com/eko999

@@ -15,43 +15,42 @@
 # ostree tree from the container image and is guaranteed present at boot.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
 # Also export lowercase proxy vars for tools that only honor lowercase.
 export http_proxy="${HTTP_PROXY:-${http_proxy:-}}"
 export https_proxy="${HTTPS_PROXY:-${https_proxy:-}}"
 export no_proxy="${NO_PROXY:-${no_proxy:-}}"
 
-# [job] plan-level aliases (review PR297-09): when the plan-level
-# HYPERVISOR/REGISTER/RHEL_COMPOSE variable is unset, promote the
-# prefixed VIRTWHO_JOB_* value into it BEFORE any ${VAR:-default}
-# evaluation below (the generator invocation, the test-file pruning,
-# the compose resolution) so the alias and the scripts agree
-# end-to-end. VIRTWHO_JOB_HYPERVISOR is lower-cased to match the
-# handler list. A set plan-level variable is never overridden; the
-# generator warns when it disagrees with the alias.
-if [ -z "${HYPERVISOR:-}" ] && [ -n "${VIRTWHO_JOB_HYPERVISOR:-}" ]; then
-    HYPERVISOR=$(printf '%s' "$VIRTWHO_JOB_HYPERVISOR" | tr '[:upper:]' '[:lower:]')
-    export HYPERVISOR
-fi
-if [ -z "${REGISTER:-}" ] && [ -n "${VIRTWHO_JOB_REGISTER:-}" ]; then
-    REGISTER="$VIRTWHO_JOB_REGISTER"
-    export REGISTER
-fi
-if [ -z "${RHEL_COMPOSE:-}" ] && [ -n "${VIRTWHO_JOB_RHEL_COMPOSE:-}" ]; then
-    RHEL_COMPOSE="$VIRTWHO_JOB_RHEL_COMPOSE"
-    export RHEL_COMPOSE
-fi
+# [job] plan-level aliases, single-sourced in lib.sh: promote
+# VIRTWHO_JOB_* into the plan-level variables BEFORE any
+# ${VAR:-default} evaluation below (the generator invocation, the
+# test-file pruning, the compose resolution) so the alias and the
+# scripts agree end-to-end.
+promote_job_aliases
 
-# Use /usr/share on bootc (persists through ostree deploy), /opt otherwise.
-if command -v bootc &>/dev/null || [ -f /run/ostree-booted ] || [ -L /ostree ]; then
-    INSTALL_DIR=/usr/share/virtwho-test
+# The shared test-tree root (lib.sh): /usr/share on bootc (persists
+# through ostree deploy), /opt otherwise.
+# VIRTWHO_PREPARE_INSTALL_DIR overrides both for the self-test
+# sandbox (the companion suite, branch cct-3162/selftests) and the
+# local fmf dry run -- the SAME knob
+# prepare-candlepin.sh uses for its marker location, so a sandboxed
+# clone and a sandboxed marker land in the same tree (the
+# plan-ordering invariant: the clone must create the tree the
+# marker goes into).
+INSTALL_DIR=$(detect_install_dir)
+if [ "$INSTALL_DIR" = /usr/share/virtwho-test ]; then
     echo "Image-mode detected: installing to ${INSTALL_DIR} (ostree-safe path)"
-else
-    INSTALL_DIR=/opt/virtwho-test
 fi
 
 git clone "${VIRTWHO_TEST_REPO:-https://github.com/VirtwhoQE/virtwho-test.git}" \
     --branch "${VIRTWHO_TEST_BRANCH:-main}" --depth 1 "${INSTALL_DIR}"
 cd "${INSTALL_DIR}"
+# Head observability: which virtwho-test commit this tree is (the
+# run log is where a watcher looks for it).
+echo "virtwho-test checkout: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
 PIP_EXTRA_ARGS=()
 if pip install --help 2>&1 | grep -q -- '--root-user-action'; then
@@ -71,7 +70,6 @@ pip install "${PIP_EXTRA_ARGS[@]}" -r requirements.txt
 # (Configure.save() opens the path with "w", which follows symlinks),
 # and the bootc copy in run-tests.sh uses cp -a, which preserves it.
 # Nothing is ever installed into the checkout itself.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bash "${SCRIPT_DIR}/generate-virtwho-ini.sh" /dev/shm/virtwho.ini
 ln -sfn /dev/shm/virtwho.ini "${INSTALL_DIR}/virtwho.ini"
 touch "${INSTALL_DIR}/.virtwho-ini-generated"
@@ -112,10 +110,80 @@ if ! echo "$RESOLVED_COMPOSE" | grep -qP '^RHEL-\d+\.\d+\.\d+-\d+'; then
 fi
 
 VIRTWHO_NEVRA=$(rpm -qa virt-who 2>/dev/null | head -1)
-VIRTWHO_NEVRA=${VIRTWHO_NEVRA:-virt-who}
+# Record the NEVRA only when a real one resolves (rpm -qa prints
+# nothing when virt-who is not installed): a bare-name placeholder
+# would clobber a correct base-ini value through the merge override.
+
+# --- version-under-test RPM cache ----------------------------------
+# The suite's package tests must examine and reinstall THE VERSION
+# UNDER TEST, never whatever the currently-enabled content repos
+# serve: once a destination is registered, the host's content source
+# does not carry virt-who (the container tier's pod repo serves no
+# virt-who packages) and repo-based installs fail. Precedence:
+# TEST_RPMS always wins (manual overrides, PR-build testing, gated
+# release builds); without it the version under test is the RHEL
+# compose's own virt-who that install-deps.sh already installed.
+# Both cases are captured HERE -- after install-deps.sh ran, BEFORE
+# any registration can switch the host's content sources -- as a
+# plain RPM file in the tree root; the sidecar below records its
+# path, run-tests.sh merges it into the ini, and the suite's
+# virtwho_install_under_test() installs from it with every repo
+# disabled. Best-effort by design: a failed cache is a loud WARNING
+# and an empty sidecar value -- the tests then fall back to the
+# TEST_RPMS URL (gating mode) or the enabled repos (hand-run local
+# suites).
+UNDERTTEST_RPM=""
+UNDERTTEST_CACHE="${INSTALL_DIR}/virt-who-under-test.rpm"
+if [ -n "${TEST_RPMS:-}" ]; then
+    # TEST_RPMS is a space-separated URL list the cct-gate pipeline
+    # builds from the Brew UMB message; cache the virt-who one (curl
+    # rides the environment proxy, the same path install-deps.sh's
+    # dnf install of TEST_RPMS uses).
+    for url in ${TEST_RPMS}; do
+        case "${url##*/}" in
+            virt-who-*.rpm)
+                if curl -fsSL --retry 3 --retry-delay 5 \
+                        --connect-timeout 10 --max-time 300 \
+                        -o "$UNDERTTEST_CACHE" "$url"; then
+                    UNDERTTEST_RPM="$UNDERTTEST_CACHE"
+                    echo "Cached the version-under-test RPM from TEST_RPMS (${url##*/})"
+                else
+                    echo "WARNING: could not cache the TEST_RPMS virt-who RPM (${url##*/}); the package tests will install from the TEST_RPMS URL at test time" >&2
+                fi
+                break
+                ;;
+        esac
+    done
+    if [ -z "$UNDERTTEST_RPM" ]; then
+        echo "WARNING: TEST_RPMS carries no virt-who RPM URL; no version-under-test cache was written" >&2
+    fi
+else
+    # No TEST_RPMS: the version under test is the compose's own
+    # virt-who (installed by install-deps.sh). `dnf download` fetches
+    # the very same package from the still-enabled compose repos
+    # regardless of its installed state; --downloadonly is the
+    # fallback for guests whose dnf lacks the download plugin.
+    if dnf download --destdir="${INSTALL_DIR}" virt-who \
+            >/dev/null 2>&1 \
+            || dnf -y install --downloadonly \
+                    --downloaddir="${INSTALL_DIR}" virt-who \
+                    >/dev/null 2>&1; then
+        for downloaded in "${INSTALL_DIR}"/virt-who-*.rpm; do
+            [ -e "$downloaded" ] || continue
+            mv -f "$downloaded" "$UNDERTTEST_CACHE"
+            UNDERTTEST_RPM="$UNDERTTEST_CACHE"
+            echo "Cached the version-under-test RPM from the compose repos ($(rpm -qp --qf '%{name}-%{version}-%{release}.%{arch}' "$UNDERTTEST_CACHE" 2>/dev/null || echo virt-who))"
+            break
+        done
+    fi
+    if [ -z "$UNDERTTEST_RPM" ]; then
+        echo "WARNING: could not cache the compose's virt-who RPM; the package tests will fall back to the enabled repos at test time" >&2
+    fi
+fi
 
 # Record the computed NON-SECRET values (resolved compose, virt-who
-# NEVRA, gating test_rpms) in a sidecar next to the test tree.
+# NEVRA, gating test_rpms, the version-under-test RPM cache) in a
+# sidecar next to the test tree.
 # run-tests.sh regenerates the tmpfs ini at test time (the execute
 # phase always has the secrets, and on bootc the prepare-phase tmpfs
 # content does not survive the container build), then merges these
@@ -125,11 +193,11 @@ VIRTWHO_NEVRA=${VIRTWHO_NEVRA:-virt-who}
 # and the hypervisor/register preseed are handled by the generator and
 # the run-tests.sh merge defaults.
 python3 - "${INSTALL_DIR}/.virtwho-computed.ini" "$RESOLVED_COMPOSE" \
-    "$VIRTWHO_NEVRA" "${TEST_RPMS:-}" <<'PYEOF'
+    "$VIRTWHO_NEVRA" "${TEST_RPMS:-}" "$UNDERTTEST_RPM" <<'PYEOF'
 import configparser
 import sys
 
-path, compose, nevra, test_rpms = sys.argv[1:5]
+path, compose, nevra, test_rpms, undertest_rpm = sys.argv[1:6]
 cfg = configparser.ConfigParser(interpolation=None)
 cfg.optionxform = str
 cfg.read(path)
@@ -138,8 +206,13 @@ if not cfg.has_section("job"):
 cfg.set("job", "rhel_compose", compose)
 if not cfg.has_section("virtwho"):
     cfg.add_section("virtwho")
-cfg.set("virtwho", "package", nevra)
+# the NEVRA is recorded ONLY when a real one resolved: an absent
+# option keeps the base-ini value through the run-tests.sh merge,
+# while a placeholder would clobber it
+if nevra:
+    cfg.set("virtwho", "package", nevra)
 cfg.set("virtwho", "test_rpms", test_rpms)
+cfg.set("virtwho", "undertest_rpm", undertest_rpm)
 with open(path, "w") as f:
     cfg.write(f, space_around_delimiters=False)
 PYEOF

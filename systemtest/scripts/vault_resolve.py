@@ -18,9 +18,8 @@ generator, and sentinels are resolved here into the tmpfs ini.
 
 Resolution is SELECTIVE: the caller names the options to resolve (the
 generator passes the active cell's sections -- see
-:func:`resolve_sections` and :func:`resolve_options`), so the
-credentials of the other hypervisor families never land on a guest
-that does not need them. Sentinels the environment already overrides
+:func:`resolve_options`), so the credentials of the other hypervisor
+families never land on a guest that does not need them. Sentinels the environment already overrides
 are not resolved at all: the env value is final, so a Vault outage
 must not block a cell whose credentials are all env-supplied.
 
@@ -35,7 +34,8 @@ from the command line:
   without an address are a configuration error. The address must use
   ``https`` -- the AppRole secret_id and the client token must never
   travel in cleartext -- unless ``VAULT_ALLOW_HTTP`` explicitly opts
-  out (loopback/fake servers in the self-test);
+  out (loopback/fake servers in the companion self-test suite,
+  branch cct-3162/selftests);
 - ``VAULT_SKIP_VERIFY``: skip the TLS certificate validation of the
   Vault server (needed with self-signed certificates; insecure);
 - ``VIRTWHO_VAULT_REQUIRED``: strict mode -- a base carrying any
@@ -44,7 +44,12 @@ from the command line:
 
 Each secret path is read at most once per resolver instance (the
 decoded payload is cached by path, failures included), and each
-(path, key) outcome is cached on top of that.
+(path, key) outcome is cached on top of that. Connection-level
+failures only (URLError, timeout, connection reset) are retried a
+bounded number of times with a short backoff -- a transient Vault or
+network blip must not abort a whole cell -- while anything the server
+answered (any HTTP status, auth/permission failures included) and any
+malformed response fails immediately and loudly.
 
 This module is stdlib-only (urllib.request) so it works in any phase
 (prepare or execute), with any python3 and no pip installs. Secret
@@ -59,7 +64,10 @@ is wrong and must be located; the token never appears anywhere.
 import http.client
 import json
 import os
+import socket
 import ssl
+import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -71,14 +79,47 @@ SENTINEL_PREFIX = "@vault:"
 STRICT_ENV_VAR = "VIRTWHO_VAULT_REQUIRED"
 
 # environment variable that allows a plaintext http:// VAULT_ADDR
-# (self-test fake servers only; the secret_id and client token would
-# otherwise travel in cleartext)
+# (companion self-test fake servers only, branch cct-3162/selftests;
+# the secret_id and client token would otherwise travel in cleartext)
 ALLOW_HTTP_ENV_VAR = "VAULT_ALLOW_HTTP"
 
 # seconds to wait for each Vault request
 REQUEST_TIMEOUT = 10
 
+# bounded retry for CONNECTION-LEVEL failures only (URLError,
+# timeout, connection reset): a transient Vault/network blip must not
+# abort a whole cell. 5 total attempts with an exponential backoff
+# between them (worst-case backoff wait ~30 s, still bounded well
+# under any step limit; each attempt keeps the 10 s request timeout).
+# Auth/permission failures (any HTTP status -- the server ANSWERED)
+# and malformed responses are final: retrying those is pointless and
+# only delays the loud failure.
+REQUEST_ATTEMPTS = 5
+RETRY_BACKOFF_SECONDS = (2, 4, 8, 16)
+
 _TRUTHY_VALUES = ("1", "true", "yes", "on")
+
+
+def _is_connection_error(error):
+    """Whether an error is a connection-level (transient) failure.
+
+    Deliberately narrow: only errors meaning the request never
+    completed are retried. Anything the server answered (HTTPError is
+    caught before this), any malformed-URL error (InvalidURL) and any
+    malformed response (ValueError from the JSON decode) is final.
+    """
+    if isinstance(error, urllib.error.URLError):
+        # HTTPError is a URLError subclass but is caught by the
+        # earlier except clause; a URLError here means the request
+        # never completed (DNS failure, refused, timed out)
+        return True
+    if isinstance(error, (socket.timeout, ConnectionError)):
+        # socket.timeout: py3.6-3.9 it is a bare OSError, py3.10+ it
+        # is TimeoutError -- name it explicitly either way.
+        # ConnectionError: reset, refused, broken pipe.
+        return True
+    return isinstance(error, http.client.RemoteDisconnected)
+
 
 
 class VaultError(Exception):
@@ -235,10 +276,16 @@ class VaultResolver:
         return resolved
 
     def _request(self, url, payload=None):
-        """One HTTP request to the Vault server; JSON body or VaultError.
+        """One Vault request (with bounded connection-level retry);
+        JSON body or VaultError.
 
-        Never lets a urllib error message through: those can embed the
-        request URL, which would leak the address of the Vault server.
+        Connection-level failures (URLError, timeout, connection
+        reset) are retried up to REQUEST_ATTEMPTS total attempts with
+        a short backoff; every other failure -- any HTTP status
+        (auth/permission included) and any malformed response -- fails
+        immediately and loudly. Never lets a urllib error message
+        through: those can embed the request URL, which would leak the
+        address of the Vault server.
         """
         body = None
         headers = {}
@@ -247,35 +294,56 @@ class VaultResolver:
             headers["Content-Type"] = "application/json"
         else:
             headers["X-Vault-Token"] = self._get_token()
-        request = urllib.request.Request(url, data=body, headers=headers)
-        # redirects are never followed (see _RefuseRedirects), so an
-        # opener with the refusal handler replaces the default one
-        handlers = [_RefuseRedirects()]
-        if self._ssl_context is not None:
-            handlers.append(
-                urllib.request.HTTPSHandler(context=self._ssl_context)
-            )
-        opener = urllib.request.build_opener(*handlers)
-        try:
-            with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            raise VaultError(
-                f"Vault request failed: HTTP {error.code}"
-            )
-        except (
-            urllib.error.URLError,
-            OSError,
-            ValueError,
-            http.client.HTTPException,
-        ) as error:
-            # InvalidURL (a space or control character in the address
-            # or in a sentinel path) derives from HTTPException, not
-            # from ValueError/OSError: without it in the tuple the
-            # error escapes as a raw traceback that echoes the URL
-            raise VaultError(
-                f"Vault request failed: {type(error).__name__}"
-            )
+        for attempt in range(1, REQUEST_ATTEMPTS + 1):
+            # the Request object is rebuilt per attempt: the opener
+            # mutates it (adds unredirected headers), so a fresh one
+            # keeps every attempt identical
+            request = urllib.request.Request(url, data=body, headers=headers)
+            # redirects are never followed (see _RefuseRedirects), so
+            # an opener with the refusal handler replaces the default
+            # one
+            handlers = [_RefuseRedirects()]
+            if self._ssl_context is not None:
+                handlers.append(
+                    urllib.request.HTTPSHandler(context=self._ssl_context)
+                )
+            opener = urllib.request.build_opener(*handlers)
+            try:
+                with opener.open(request, timeout=REQUEST_TIMEOUT) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                # the server ANSWERED: an auth/permission failure
+                # (403) or any other status is final -- retrying it
+                # would only delay the loud failure
+                raise VaultError(
+                    f"Vault request failed: HTTP {error.code}"
+                )
+            except (
+                urllib.error.URLError,
+                OSError,
+                ValueError,
+                http.client.HTTPException,
+            ) as error:
+                # InvalidURL (a space or control character in the
+                # address or in a sentinel path) derives from
+                # HTTPException, not from ValueError/OSError: without
+                # it in the tuple the error escapes as a raw traceback
+                # that echoes the URL
+                if attempt < REQUEST_ATTEMPTS and _is_connection_error(error):
+                    # name the attempt number and the error class
+                    # only -- never the URL (it embeds the address of
+                    # the Vault server) and never any value
+                    print(
+                        f"WARNING: Vault request attempt {attempt} of"
+                        f" {REQUEST_ATTEMPTS} failed with"
+                        f" {type(error).__name__}; retrying",
+                        file=sys.stderr,
+                    )
+                    time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+                    continue
+                raise VaultError(
+                    f"Vault request failed: {type(error).__name__}"
+                )
 
     def _read_path(self, path):
         """The decoded kv2 payload of a path, read at most once.
@@ -408,22 +476,3 @@ def resolve_options(cfg, targets, resolver=None):
         cfg.set(section, option, secret)
         resolved += 1
     return resolved
-
-
-def resolve_sections(cfg, sections, resolver=None):
-    """Resolve every sentinel of the REQUESTED sections, in place.
-
-    Section-level wrapper over :func:`resolve_options`: every
-    sentinel of the named sections is a target. The generator uses
-    :func:`resolve_options` directly (it excludes env-overridden
-    slots); this wrapper keeps the simple all-sentinels-of-a-section
-    contract for other callers.
-    """
-    targets = [
-        (section, option)
-        for section in sections
-        if cfg.has_section(section)
-        for option in cfg.options(section)
-        if is_sentinel(cfg.get(section, option))
-    ]
-    return resolve_options(cfg, targets, resolver)
