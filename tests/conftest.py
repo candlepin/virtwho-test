@@ -1,3 +1,4 @@
+import os
 import time
 
 import pytest
@@ -30,6 +31,116 @@ def wait_for_consumer(rhsm, hostname, retries=5, delay=3):
             return detail
         time.sleep(delay)
     return None
+
+
+def candlepin_destination_absent():
+    """Why the containerized Candlepin destination is unusable, or None.
+
+    The destination tier is recorded in [job] destination by
+    generate-virtwho-ini.sh (container is the default there). When
+    that tier is selected but prepare-candlepin.sh could not deploy
+    the pod (no podman, unreachable registry, bootc container-build
+    prepare context), the marker file it writes on success is
+    missing: the destination-coupled tests must then SKIP LOUDLY
+    instead of failing confusingly against an absent server (or, far
+    worse, passing vacuously). A missing [job] destination option
+    (a hand-written local ini) means the old contract: no skip.
+    """
+    if REGISTER != "rhsm":
+        return None
+    if getattr(config.job, "destination", "") != "container":
+        return None
+    marker = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ".virtwho-candlepin-ready",
+    )
+    if os.path.exists(marker):
+        return None
+    return (
+        "the containerized Candlepin destination was not deployed "
+        "(prepare-candlepin.sh skipped or failed -- see the prepare "
+        "phase logs; no podman, an unreachable registry or a bootc "
+        "container-build prepare context are the usual causes)"
+    )
+
+
+def candlepin_guest_unreachable(sm):
+    """Why the containerized destination cannot be used FROM THE GUEST
+    context, or None when it can (or the question does not apply).
+
+    prepare-candlepin.sh configures ONLY the pod host (the TF guest):
+    the destination name resolves there via /etc/hosts and the pod CA
+    is trusted there. A remote guest registering against the same
+    serverurl (the sm_guest flow) has neither -- and a kubevirt
+    cluster guest may have no direct egress route to the pod host at
+    all. rhsm-qe hit the same wall (their containerized mode simply
+    leaves the remote-client tests unset); until trust is distributed
+    to routable guests (a documented follow-up: push the CA and a
+    hosts entry over the existing sshpass channel), the guest-coupled
+    tests SKIP with this reason instead of failing on an
+    unresolvable serverurl -- keeping the container tier's verdict
+    honest (LESSON-01 of the rhsm-qe lessons review).
+
+    The probe is TWO-STAGE (review DEV-03): first WITHOUT -k (the
+    exact TLS shape subscription-manager uses -- the register's
+    connection must verify, not just route); when that fails, a
+    bounded -k retry distinguishes the two failure classes so the
+    skip reason names the actual limitation: "reachable but its CA is
+    not trusted on the guest" (trust distribution is the follow-up)
+    vs "not reachable from the guest at all" (routing/egress).
+    """
+    if REGISTER != "rhsm":
+        return None
+    if getattr(config.job, "destination", "") != "container":
+        return None
+    # The probe runs ON the guest over the fixture's own SSH channel,
+    # against the exact serverurl subscription-manager would use.
+    from virtwho.destination import (
+        PROBE_TRUSTED,
+        PROBE_UNTRUSTED_CA,
+        guest_probe_command,
+        probe_outcome,
+        probe_reachable,
+        status_url,
+    )
+
+    def _run(command):
+        try:
+            return sm.ssh.runcmd(
+                command, if_stdout=True, timeout=30)
+        except (OSError, FailException):
+            return 1, ""
+
+    url = status_url(sm.server, sm.port, sm.prefix)
+    # bypass_proxy (the build-#179 class, guest-side): the guest's
+    # environment may carry the pipeline's HTTPS_PROXY, and the probe
+    # target is the per-run pod -- the bypass is scoped to the
+    # destination host only, so the guest keeps the proxy for its
+    # other egress.
+    verified = _run(guest_probe_command(url, bypass_proxy=True))
+    # Stage two only runs when the verified probe failed: a guest
+    # that already verifies needs no -k retry.
+    insecure = (1, "")
+    if not probe_reachable(*verified):
+        insecure = _run(
+            guest_probe_command(url, insecure=True, bypass_proxy=True))
+    outcome = probe_outcome(verified, insecure)
+    if outcome == PROBE_TRUSTED:
+        return None
+    if outcome == PROBE_UNTRUSTED_CA:
+        return (
+            f"the containerized Candlepin destination {url} is "
+            "reachable from the guest but its CA is not trusted on the guest "
+            "(trust distribution is the documented follow-up -- see the "
+            "PR caveats)"
+        )
+    return (
+        f"the containerized Candlepin destination {url} is not reachable "
+        "from the guest: the destination name and its CA are configured "
+        "on the pod host only, and a cluster guest may have no route to "
+        "it at all (distributing trust to routable guests is a documented "
+        "follow-up -- see the PR caveats)"
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -231,7 +342,7 @@ def sm_guest():
     port = 22
     if HYPERVISOR == "kubevirt":
         port = hypervisor_handler.guest_port
-    return SubscriptionManager(
+    sm = SubscriptionManager(
         host=hypervisor_handler.guest_ip,
         username=hypervisor_handler.guest_username,
         password=hypervisor_handler.guest_password,
@@ -239,6 +350,16 @@ def sm_guest():
         register_type=REGISTER,
         org=register_handler.default_org,
     )
+    # rhsm-qe LESSON-01: before any guest-registering test runs, prove
+    # the destination is reachable FROM the guest; a guest that cannot
+    # resolve/route the pod skips loudly here (mirroring the
+    # candlepin_destination_absent() pattern) instead of failing its
+    # registrations against an unreachable serverurl. Distributing
+    # trust (CA + hosts entry) to routable guests is the follow-up.
+    unreachable = candlepin_guest_unreachable(sm)
+    if unreachable:
+        pytest.skip(unreachable)
+    return sm
 
 
 @pytest.fixture(scope="function")
@@ -294,6 +415,12 @@ def satellite():
 def rhsm():
     """Instantication of class RHSM()"""
     if REGISTER == "rhsm":
+        # Loud, honest skip when the container tier was selected but
+        # the pod is absent: the server-side verification this class
+        # performs would only produce confusing connection errors.
+        absent = candlepin_destination_absent()
+        if absent:
+            pytest.skip(absent)
         return RHSM()
     return None
 
@@ -677,7 +804,10 @@ def register_data():
     return data
 
 
-SQUID_IMAGE = "images.paas.redhat.com/rhsmqe/rhsm-squid:latest"
+# The bad-proxy container image comes from the environment; there is
+# no default (an internal registry literal does not belong in a public
+# repo). Delivered as a plain request-time variable by the pipelines.
+SQUID_IMAGE = os.environ.get("VIRTWHO_SQUID_IMAGE", "")
 SQUID_CONTAINER = "squid-bad"
 SQUID_PROXY_MODES = {
     "unauth": {
@@ -699,6 +829,10 @@ def bad_proxy_container(ssh_host):
     Yields a dict with server, container name, and per-mode port details.
     Tears down the container on completion regardless of test outcome."""
     target_domain = register_handler.server
+    if not SQUID_IMAGE:
+        pytest.skip(
+            "VIRTWHO_SQUID_IMAGE is not set; skipping the bad-proxy container tests"
+        )
     ssh_host.runcmd(f"podman rm -f {SQUID_CONTAINER} 2>/dev/null || true")
     port_args = " ".join(
         f"-p {m['port']}:{m['port']}" for m in SQUID_PROXY_MODES.values()

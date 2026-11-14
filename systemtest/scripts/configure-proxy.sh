@@ -13,6 +13,10 @@
 # configuration is written to disk and takes effect when the guest boots.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
 # Parse host and port from the environment proxy URL (set by the TMT plan
 # environment block in regression.fmf or by CI).  Accepts formats:
 # http://host:port, host:port, host.  There is no default: without
@@ -25,17 +29,27 @@ PROXY_PORT=""
 if [ -z "$_proxy_url" ]; then
     echo "WARNING: HTTPS_PROXY/HTTP_PROXY not set; skipping subscription-manager proxy configuration"
 else
-    # Strip protocol prefix and trailing slash
-    _hostport="${_proxy_url#http://}"
-    _hostport="${_hostport#https://}"
-    _hostport="${_hostport%/}"
-    PROXY_HOST="${_hostport%%:*}"
-    PROXY_PORT="${_hostport##*:}"
-    # If no port was in the string, default to 3128
-    [ "$PROXY_PORT" = "$PROXY_HOST" ] && PROXY_PORT=3128
+    # the shared parser (lib.sh): strip protocol prefix and trailing
+    # slash, split host:port, default the port to 3128
+    parse_proxy_url "$_proxy_url"
 fi
 
-if [ "${REGISTER:-rhsm}" = "rhsm" ] && [ -n "${PROXY_HOST:-}" ]; then
+# Destination tier (CCT-3155, the build-#179 defect class): in
+# container mode the subscription destination is the per-run
+# Candlepin pod on THIS guest -- subscription-manager must reach it
+# directly. rhsm.conf is subscription-manager's only proxy source
+# (its commands run through ssh and do not inherit this process's
+# environment, so a no_proxy export cannot save them), and a proxy
+# can never resolve or route the guest's own pod ports: configuring
+# it here would deterministically break every registration in the
+# container tier. The proxy below exists for the stage tier (the
+# preprod lockdown traversal); the default mirrors the generator's
+# destination knob: container.
+DESTINATION=${VIRTWHO_DESTINATION:-container}
+
+if [ "$DESTINATION" = "container" ]; then
+    echo "SKIP: VIRTWHO_DESTINATION=container; the destination is the per-run Candlepin pod on this guest -- subscription-manager reaches it directly, no rhsm.conf proxy is configured (a proxy could never route the guest's own pod ports)"
+elif [ "${REGISTER:-rhsm}" = "rhsm" ] && [ -n "${PROXY_HOST:-}" ]; then
     if command -v subscription-manager &>/dev/null; then
         subscription-manager config \
             --server.proxy_hostname="$PROXY_HOST" \

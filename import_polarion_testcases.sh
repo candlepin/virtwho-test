@@ -1,6 +1,7 @@
 #!/bin/bash
 # One-time import of virt-who test cases to Polarion RHELSS project.
-# Prerequisites: VPN connected, POLARION_USER and POLARION_PASS set.
+# Prerequisites: VPN connected, POLARION_USER, POLARION_PASS and
+# POLARION_URL set.
 # Run from virtwho-test repo root after generating test-cases.xml:
 #
 #   PYTHONPATH=. betelgeuse --config-module custom_betelgeuse_config \
@@ -17,18 +18,21 @@ if [[ ! -f "$XML_FILE" ]]; then
     exit 1
 fi
 
-if [[ -z "${POLARION_USER:-}" || -z "${POLARION_PASS:-}" ]]; then
-    echo "ERROR: Set POLARION_USER and POLARION_PASS environment variables."
+if [[ -z "${POLARION_USER:-}" || -z "${POLARION_PASS:-}" || -z "${POLARION_URL:-}" ]]; then
+    echo "ERROR: Set POLARION_USER, POLARION_PASS and POLARION_URL environment variables."
     exit 1
 fi
 
 echo "Importing $(grep -c "<testcase " "$XML_FILE") test cases to Polarion RHELSS..."
+# The Polarion URL is operator-supplied (POLARION_URL); the default is
+# an RFC 2606 placeholder, not a real service.
+POLARION_URL=${POLARION_URL:-https://polarion.example.invalid/polarion/import/testcase}
 # -k skips TLS verification; internal Polarion uses a corporate CA
 # that isn't in the default trust store on most dev machines.
 curl -k -u "$POLARION_USER:$POLARION_PASS" \
     -X POST \
     -F file=@"$XML_FILE" \
-    https://polarion.engineering.redhat.com/polarion/import/testcase
+    "$POLARION_URL"
 
 echo ""
 echo "Import submitted. Check Polarion for status."

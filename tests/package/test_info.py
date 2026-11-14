@@ -13,7 +13,14 @@ import re
 
 import pytest
 
-from virtwho import RHEL_COMPOSE, TEST_RPMS, VIRTWHO_PKG, VIRTWHO_VERSION, base
+from virtwho import (
+    RHEL_COMPOSE,
+    TEST_RPMS,
+    VIRTWHO_PKG,
+    VIRTWHO_UNDERTEST_RPM,
+    VIRTWHO_VERSION,
+    base,
+)
 from virtwho.settings import DOCS_DIR, TEMP_DIR
 
 pytestmark = pytest.mark.notImageMode
@@ -25,7 +32,7 @@ pytestmark = pytest.mark.notImageMode
 class TestVirtwhoPackageInfo:
     @pytest.mark.tier1
     def test_shipped_in_supported_arch(self, ssh_host):
-        """Test the virt-who package is available in repos for all supported arches
+        """Test the virt-who version under test is shipped in a supported arch
 
         :title: virt-who: package: test package is shipped in arch
         :id: f273943a-595f-4995-9e7c-fd266253642f
@@ -33,19 +40,34 @@ class TestVirtwhoPackageInfo:
         :tags: package,tier1
         :customerscenario: false
         :steps:
-            1. use dnf repoquery to check virt-who availability per arch
+            1. check the arch of the version-under-test RPM (the
+               package the prepare phase installed: TEST_RPMS when
+               set, else the compose's own virt-who)
 
         :expectedresults:
-            1. virt-who package is available for each supported arch
+            1. virt-who is shipped in a supported arch
         """
+        # Run-#7 ruling: the version under test is what the prepare
+        # phase installed (TEST_RPMS has precedence, else the
+        # compose's own virt-who) -- NEVER whatever the currently
+        # enabled content repos serve. Once a destination is
+        # registered its content repo is the only enabled repo, and
+        # the container tier's pod repo does not carry virt-who (the
+        # run-#7 regression: a dnf repoquery against it came back
+        # empty). Query the cached version-under-test RPM when the
+        # prepare phase wrote one, else the installed package (which
+        # IS the version under test in both modes).
         archs = ["x86_64", "noarch", "ppc64le", "aarch64", "s390x"]
-        _, output = ssh_host.runcmd(
-            "dnf repoquery --available --archlist="
-            + ",".join(archs)
-            + " virt-who 2>/dev/null"
-        )
-        assert "virt-who" in output, (
-            f"virt-who not found via repoquery for arches {archs}"
+        if VIRTWHO_UNDERTEST_RPM:
+            _, output = ssh_host.runcmd(
+                f"rpm -qp --qf '%{{arch}}' {VIRTWHO_UNDERTEST_RPM}"
+            )
+        else:
+            _, output = ssh_host.runcmd("rpm -q --qf '%{arch}' virt-who")
+        arch = output.strip()
+        assert arch in archs, (
+            f"the virt-who version under test is shipped in the "
+            f"unsupported arch {arch!r} (supported: {archs})"
         )
 
     @pytest.mark.tier1

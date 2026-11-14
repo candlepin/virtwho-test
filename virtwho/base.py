@@ -6,7 +6,12 @@ import shlex
 import string
 import time
 
-from virtwho import FailException, logger
+from virtwho import (
+    TEST_RPMS,
+    VIRTWHO_UNDERTEST_RPM,
+    FailException,
+    logger,
+)
 from virtwho.settings import config
 
 
@@ -429,6 +434,41 @@ def dnf_can_downgrade(ssh, pkg_name):
     return any(v != installed for v in versions)
 
 
+def virtwho_install_under_test(ssh):
+    """Install virt-who's VERSION UNDER TEST (the run-#7 ruling).
+
+    Precedence: TEST_RPMS first (manual overrides, PR-build testing,
+    gated release builds -- the URL list the cct-gate pipeline
+    delivers), else the compose-provided RPM cached by
+    setup-virtwho-test.sh at prepare time (BEFORE any registration
+    could switch the host's content sources), else -- the hand-run
+    local-suite shape only -- the enabled repos. The destination's
+    content repo is NEVER the intended source: the container tier's
+    registered host gets its content from the pod, which does not
+    serve virt-who packages (run #7 / build #181: the repo-based
+    install failed exactly this way). The file/URL installs disable
+    every repo so a broken destination repo cannot even break the
+    metadata refresh; the dependencies of the just-removed package
+    are still installed, which is all the resolution needs.
+
+    :param ssh: ssh access of testing host
+    """
+    if TEST_RPMS:
+        cmd = f"dnf -y install --allowerasing --disablerepo='*' {TEST_RPMS}"
+    elif VIRTWHO_UNDERTEST_RPM:
+        cmd = (
+            f"dnf -y install --allowerasing --disablerepo='*' "
+            f"{VIRTWHO_UNDERTEST_RPM}"
+        )
+    else:
+        cmd = "dnf -y install --allowerasing virt-who"
+    ssh.runcmd(cmd)
+    if package_check(ssh, "virt-who") is False:
+        raise FailException(
+            "Failed to install the virt-who version under test"
+        )
+
+
 def package_install(ssh, pkg_name, rpm=None):
     """
     Install a package by yum or rpm
@@ -790,7 +830,7 @@ def system_reboot(ssh):
 
 def virtwho_package_url(pkg, rhel_compose_id, rhel_compose_path=""):
     """
-    Get the virt-who package url from http://download.devel.redhat.com/
+    Get the virt-who package url from http://download.example.com/
     for downloading.
     :param pkg: virt-who package, such as virt-who-1.31.26-1.el9.noarch
     :param rhel_compose_id: rhel compose id

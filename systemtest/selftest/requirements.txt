@@ -1,0 +1,9 @@
+# Host-side self-test dependencies (systemtest/selftest/).
+#
+# Deliberately SEPARATE from the repo-root requirements.txt: that one
+# pins the guest suite's environment (pytest==7.2.2 among many guest-
+# side packages), while this harness only needs what runs the REAL
+# bash scripts and their stubs on the CI host. The Lint workflow's
+# selftest job installs exactly this file (pip install -r).
+pytest~=8.0
+pyyaml~=6.0

@@ -19,6 +19,7 @@ from virtwho.base import (
     package_install,
     package_uninstall,
     random_string,
+    virtwho_install_under_test,
 )
 
 pytestmark = pytest.mark.notImageMode
@@ -36,16 +37,26 @@ class TestInstallUninstall:
         :customerscenario: false
         :steps:
             1. uninstall virt-who by #dnf remove virt-who
-            2. install virt-who by #dnf install virt-who
+            2. install the version under test by #dnf install
             3. check the /etc/virt-who.d/template.conf
         :expectedresults:
-            1. virt-who can be removed and reinstalled from repos successfully.
+            1. virt-who can be removed and the version under test
+               reinstalled successfully (TEST_RPMS when set, else the
+               compose-provided package -- never the destination's
+               content repo, which does not serve virt-who in the
+               container tier).
             2.
         """
         try:
             package_uninstall(ssh_host, "virt-who")
             assert package_check(ssh_host, "virt-who") is False
-            package_install(ssh_host, "virt-who")
+            # Run-#7 ruling: reinstall the VERSION UNDER TEST
+            # (TEST_RPMS has precedence, else the compose-provided
+            # RPM cached at prepare time), never whatever the
+            # currently-enabled content repos serve -- the container
+            # tier's registered host gets its content from the pod's
+            # repo, which does not carry virt-who.
+            virtwho_install_under_test(ssh_host)
             if TEST_RPMS:
                 assert package_check(ssh_host, "virt-who") is not False
             else:
@@ -80,10 +91,12 @@ class TestInstallUninstall:
             lines = output.strip().split("\n")
             assert len(lines) == line_num
         finally:
-            if TEST_RPMS:
-                ssh_host.runcmd(f"dnf -y install --allowerasing {TEST_RPMS}")
-            elif package_check(ssh_host, "virt-who") is False:
-                package_install(ssh_host, "virt-who")
+            # TEST_RPMS mode restores unconditionally (the ini's
+            # package value can be stale, so presence alone is not
+            # proof of the right version -- the historical shape);
+            # compose mode reinstalls only when the package is gone.
+            if TEST_RPMS or package_check(ssh_host, "virt-who") is False:
+                virtwho_install_under_test(ssh_host)
 
     @pytest.mark.tier1
     def test_install_uninstall_by_rpm(self, ssh_host):

@@ -9,18 +9,59 @@
 # daemon will fail with ApiException(403).
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
 # Mirror the path detection in setup-virtwho-test.sh: use /usr/share on bootc
-# (ostree-safe), /opt otherwise.
-if command -v bootc &>/dev/null || [ -f /run/ostree-booted ] || [ -L /ostree ]; then
+# (ostree-safe), /opt otherwise. VIRTWHO_PREPARE_INSTALL_DIR overrides both
+# for the self-test sandbox.
+if [ -n "${VIRTWHO_PREPARE_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$VIRTWHO_PREPARE_INSTALL_DIR"
+elif command -v bootc &>/dev/null || [ -f /run/ostree-booted ] || [ -L /ostree ]; then
     INSTALL_DIR=/usr/share/virtwho-test
 else
     INSTALL_DIR=/opt/virtwho-test
 fi
 cd "$INSTALL_DIR"
 
-ini_get() {
-    awk -F= "/^\[kubevirt\]/{f=1;next} /^\[/{f=0} f&&/^${1}=/{print \$2}" virtwho.ini | tr -d ' '
-}
+# configparser, never awk (the convention discover-guest-ips.sh
+# codifies): `key = value` spacing is configparser-valid but an awk
+# ^key= match silently skips it, which here would silently skip the
+# kubeconfig generation AND its write-side confinement; an
+# `=`-containing value would be truncated at the first `=`. ONE
+# python invocation reads all the [kubevirt] options this script
+# needs; the values are returned to the caller only, never printed.
+# The stream is NUL-delimited (not newline-delimited): an ini value
+# may itself contain a newline (configparser joins indented
+# continuation lines in a hand-edited ini), which a newline-delimited
+# stream would silently shift into the next slot. strict=False so a
+# duplicate option degrades to the skip paths instead of dying here.
+mapfile -d '' -t KV_VALUES < <(python3 - <<'PYEOF'
+import configparser
+import sys
+
+cfg = configparser.ConfigParser(interpolation=None, strict=False)
+cfg.optionxform = str
+try:
+    cfg.read("virtwho.ini")
+except configparser.Error:
+    pass
+for option in ("endpoint", "token", "config_file", "config_file_no_cert",
+               "guest_ip", "guest_port", "guest_username", "guest_password"):
+    value = (cfg.get("kubevirt", option, fallback="")
+             if cfg.has_section("kubevirt") else "")
+    sys.stdout.write(value + "\0")
+PYEOF
+)
+KV_ENDPOINT=${KV_VALUES[0]:-}
+KV_TOKEN=${KV_VALUES[1]:-}
+KV_CONFIG_FILE=${KV_VALUES[2]:-}
+KV_CONFIG_NO_CERT=${KV_VALUES[3]:-}
+KV_GUEST_IP=${KV_VALUES[4]:-}
+KV_GUEST_PORT=${KV_VALUES[5]:-}
+KV_GUEST_USER=${KV_VALUES[6]:-}
+KV_GUEST_PASS=${KV_VALUES[7]:-}
 
 # Inject the real SA token (passed via the VIRTWHO_KUBEVIRT_TOKEN secret
 # or the legacy KUBEVIRT_TOKEN env var).
@@ -138,11 +179,6 @@ else:
     echo "Injected KUBEVIRT_TOKEN and updated dynamic coordinates in virtwho.ini"
 fi
 
-KV_ENDPOINT=$(ini_get endpoint)
-KV_TOKEN=$(ini_get token)
-KV_CONFIG_FILE=$(ini_get config_file)
-KV_CONFIG_NO_CERT=$(ini_get config_file_no_cert)
-
 # Generate kubeconfig YAML from SA token (token passed via the
 # environment, not argv, to keep it out of /proc/<pid>/cmdline). The
 # kubeconfig contains the token, so it is created 0600 from the start
@@ -152,13 +188,27 @@ KV_CONFIG_NO_CERT=$(ini_get config_file_no_cert)
 # test of the target directory and skip with a clear message when it
 # fails -- the kubevirt tests then cannot run with a kubeconfig
 # (review PR297-04; this implements the README claim).
+# Write-side kubeconfig confinement: the kubeconfig paths come from
+# the DOWNLOADED base ini (untrusted input), so the token-bearing
+# files may only be written to an absolute path canonicalized under
+# the kubeconfig root (/root -- where the generator's defaults and
+# the daemon's fixed paths live; kv_root() reads the SAME
+# VIRTWHO_KUBECONFIG_ROOT knob the shred side confines to in
+# cleanup-secrets.sh -- one gate for both sides, single-sourced in
+# lib.sh's kv_path_is_confined). Anything else is refused with a
+# warning: no token may ever be created where the finish step would
+# not shred it.
+KV_ROOT=$(kv_root)
 if [ -n "$KV_ENDPOINT" ] && [ -n "$KV_TOKEN" ] && [ -n "$KV_CONFIG_FILE" ]; then
-    KV_CONFIG_DIR=$(dirname -- "$KV_CONFIG_FILE")
-    if [ ! -w "$KV_CONFIG_DIR" ]; then
-        echo "WARNING: ${KV_CONFIG_DIR} is not writable (kubevirt image-mode/bootc runs prepare without a writable /root); skipping kubeconfig generation at ${KV_CONFIG_FILE} -- the kubevirt tests cannot run with a kubeconfig"
+    if ! kv_path_is_confined "$KV_CONFIG_FILE"; then
+        echo "WARNING: refusing to write the kubeconfig to ${KV_CONFIG_FILE} (not an absolute path under ${KV_ROOT}); skipping kubeconfig generation -- cleanup-secrets.sh would not shred it there"
     else
-        echo "Generating kubeconfig at $KV_CONFIG_FILE for $KV_ENDPOINT"
-        KUBEVIRT_TOKEN="$KV_TOKEN" python3 -c "
+        KV_CONFIG_DIR=$(dirname -- "$KV_CONFIG_FILE")
+        if [ ! -w "$KV_CONFIG_DIR" ]; then
+            echo "WARNING: ${KV_CONFIG_DIR} is not writable (kubevirt image-mode/bootc runs prepare without a writable /root); skipping kubeconfig generation at ${KV_CONFIG_FILE} -- the kubevirt tests cannot run with a kubeconfig"
+        else
+            echo "Generating kubeconfig at $KV_CONFIG_FILE for $KV_ENDPOINT"
+            KUBEVIRT_TOKEN="$KV_TOKEN" python3 -c "
 import os, sys, yaml
 kc = {
     'apiVersion': 'v1', 'kind': 'Config',
@@ -174,15 +224,20 @@ os.fchmod(fd, 0o600)
 with os.fdopen(fd, 'w') as f:
     yaml.safe_dump(kc, f, default_flow_style=False)
 " "$KV_ENDPOINT" "$KV_CONFIG_FILE"
-        echo "Kubeconfig written ($(wc -c < "$KV_CONFIG_FILE") bytes, mode 0600)"
+            echo "Kubeconfig written ($(wc -c < "$KV_CONFIG_FILE") bytes, mode 0600)"
 
-        if [ -n "$KV_CONFIG_NO_CERT" ]; then
-            KV_NOCERT_DIR=$(dirname -- "$KV_CONFIG_NO_CERT")
-            if [ -w "$KV_NOCERT_DIR" ]; then
-                install -m 600 "$KV_CONFIG_FILE" "$KV_CONFIG_NO_CERT"
-                echo "No-cert kubeconfig written to $KV_CONFIG_NO_CERT (mode 0600)"
-            else
-                echo "WARNING: ${KV_NOCERT_DIR} is not writable; skipping the no-cert kubeconfig copy"
+            if [ -n "$KV_CONFIG_NO_CERT" ]; then
+                if ! kv_path_is_confined "$KV_CONFIG_NO_CERT"; then
+                    echo "WARNING: refusing to write the no-cert kubeconfig copy to ${KV_CONFIG_NO_CERT} (not an absolute path under ${KV_ROOT}); skipping the copy -- cleanup-secrets.sh would not shred it there"
+                else
+                    KV_NOCERT_DIR=$(dirname -- "$KV_CONFIG_NO_CERT")
+                    if [ -w "$KV_NOCERT_DIR" ]; then
+                        install -m 600 "$KV_CONFIG_FILE" "$KV_CONFIG_NO_CERT"
+                        echo "No-cert kubeconfig written to $KV_CONFIG_NO_CERT (mode 0600)"
+                    else
+                        echo "WARNING: ${KV_NOCERT_DIR} is not writable; skipping the no-cert kubeconfig copy"
+                    fi
+                fi
             fi
         fi
     fi
@@ -194,30 +249,48 @@ fi
 # HTTPS_PROXY / HTTP_PROXY environment variables (the same contract as
 # configure-proxy.sh); there is no default -- without the variables the
 # configuration is skipped.
-KV_GUEST_IP=$(ini_get guest_ip)
-KV_GUEST_PORT=$(ini_get guest_port)
-KV_GUEST_USER=$(ini_get guest_username)
-KV_GUEST_PASS=$(ini_get guest_password)
 if [ -n "$KV_GUEST_IP" ] && [ -n "$KV_GUEST_PORT" ]; then
-    _proxy_url="${HTTPS_PROXY:-${HTTP_PROXY:-}}"
-    if [ -z "$_proxy_url" ]; then
-        echo "WARNING: HTTPS_PROXY/HTTP_PROXY not set; skipping guest VM proxy configuration"
-    else
-        _hostport="${_proxy_url#http://}"
-        _hostport="${_hostport#https://}"
-        _hostport="${_hostport%/}"
-        PROXY_HOST="${_hostport%%:*}"
-        PROXY_PORT="${_hostport##*:}"
-        # If no port was in the string, default to 3128
-        [ "$PROXY_PORT" = "$PROXY_HOST" ] && PROXY_PORT=3128
-        echo "Configuring proxy on KubeVirt guest VM at ${KV_GUEST_IP}:${KV_GUEST_PORT}"
-        # sshpass -e with SSHPASS set only for this command keeps the
-        # password off the process list (/proc/*/cmdline).
-        SSHPASS="${KV_GUEST_PASS:-redhat}" sshpass -e \
-            ssh -o StrictHostKeyChecking=no -p "$KV_GUEST_PORT" \
-            "${KV_GUEST_USER:-root}@${KV_GUEST_IP}" \
-            "subscription-manager config --server.proxy_hostname=${PROXY_HOST} --server.proxy_port=${PROXY_PORT}" \
-            && echo "Guest VM proxy configured" \
-            || echo "WARNING: Failed to configure guest VM proxy"
-    fi
+    # The guest password comes from the ini (the @vault: sentinel of
+    # the base ini, resolved for the active section, or an env
+    # secret): there is NO default -- a published default would be a
+    # working password for every guest this suite builds. An empty
+    # value or an unresolved @vault: sentinel means the credential
+    # was not delivered: warn and skip (the kubevirt tests that need
+    # the proxy then fail loudly on their own).
+    case "$KV_GUEST_PASS" in
+        "" | @vault:*)
+            echo "WARNING: [kubevirt] guest_password is not set (or is an unresolved @vault: sentinel); there is no default -- skipping guest VM proxy configuration"
+            ;;
+        *)
+            # Destination tier (CCT-3155, the build-#179 class): in
+            # container mode the kubevirt guest registers against the
+            # per-run Candlepin pod on the TEST HOST, not an external
+            # subscription server -- a proxy configured here could
+            # never route the guest to the pod host's published port.
+            # The guest either reaches the pod host directly (its
+            # registrations work) or the suite's guest-reachability
+            # probe skips the guest-coupled tests loudly (LESSON-01);
+            # a proxy would break the first case without enabling the
+            # second. The default mirrors the generator's knob.
+            if [ "${VIRTWHO_DESTINATION:-container}" = "container" ]; then
+                echo "SKIP: VIRTWHO_DESTINATION=container; the destination is the per-run Candlepin pod on the test host -- no guest VM proxy is configured (the guest must reach the pod host directly; a proxy could never route it there)"
+            else
+                _proxy_url="${HTTPS_PROXY:-${HTTP_PROXY:-}}"
+                if [ -z "$_proxy_url" ]; then
+                    echo "WARNING: HTTPS_PROXY/HTTP_PROXY not set; skipping guest VM proxy configuration"
+                else
+                    parse_proxy_url "$_proxy_url"
+                    echo "Configuring proxy on KubeVirt guest VM at ${KV_GUEST_IP}:${KV_GUEST_PORT}"
+                    # sshpass -e with SSHPASS set only for this command keeps the
+                    # password off the process list (/proc/*/cmdline).
+                    SSHPASS="$KV_GUEST_PASS" sshpass -e \
+                        ssh -o StrictHostKeyChecking=no -p "$KV_GUEST_PORT" \
+                        "${KV_GUEST_USER:-root}@${KV_GUEST_IP}" \
+                        "subscription-manager config --server.proxy_hostname=${PROXY_HOST} --server.proxy_port=${PROXY_PORT}" \
+                        && echo "Guest VM proxy configured" \
+                        || echo "WARNING: Failed to configure guest VM proxy"
+                fi
+            fi
+            ;;
+    esac
 fi

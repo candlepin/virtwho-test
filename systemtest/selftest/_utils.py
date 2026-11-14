@@ -1,0 +1,188 @@
+"""Shared helpers for the host-side self-tests (systemtest/selftest).
+
+Pure, pytest-free helpers used by conftest.py and the test modules.
+The scripts under test stay BASH -- these helpers only invoke them
+hermetically: mktemp sandboxes under /dev/shm (tmpfs, so the
+secret-bearing inis never touch real disk), `env -u`-style variable
+hygiene and PATH-injected command stubs. All values used by the
+tests are dummies (non-secret, non-real): example.com /
+example.invalid names, TEST-NET-1/2/3 addresses, FAKE-* payloads.
+"""
+
+import configparser
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+from pathlib import Path
+
+# The REAL scripts under test, resolved relative to this file so a
+# copied (e.g. mutation-tested) tree is exercised as-is, never a
+# drifted copy.
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+
+# The repository root (for the source-level contract checks).
+REPO_ROOT = SCRIPTS_DIR.parents[1]
+
+# Like the bash self-tests before it, the suite sandboxes under
+# /dev/shm: the generated inis carry dummy credentials and must never
+# land on real disk.
+SHM_DIR = "/dev/shm"
+
+
+def shm_workdir():
+    """A fresh unpredictable sandbox directory under /dev/shm."""
+    return Path(tempfile.mkdtemp(prefix="virtwho-selftest.", dir=SHM_DIR))
+
+
+# The name families the scripts under test read as knobs: removed
+# from the ambient environment by run_env() unless a test explicitly
+# provides them (see there).
+_AMBIENT_KNOB_PREFIXES = ("VIRTWHO_", "VAULT_")
+_AMBIENT_KNOB_NAMES = (
+    "KUBEVIRT_TOKEN", "HYPERVISOR", "REGISTER", "RHEL_COMPOSE",
+    # proxy environment: ambient proxy settings are exactly the
+    # environment-leakage class the knob stripping exists for (a
+    # developer shell or CI host proxy must not skew outcomes), and
+    # the with-proxy behaviors -- the build-#179 bypass pins -- set
+    # the variables EXPLICITLY, which always wins over the stripping
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+
+
+def run_env(env=None, unset=()):
+    """The ambient environment with knob hygiene and overrides.
+
+    The knob families the scripts under test read (VIRTWHO_*, VAULT_*,
+    KUBEVIRT_TOKEN, HYPERVISOR, REGISTER, RHEL_COMPOSE -- the last
+    covers VIRTWHO_INI_SHA256 through the prefix -- and the proxy
+    environment variables, whose ambient values must not leak into
+    the proxy-bypass pins) are removed from the
+    AMBIENT environment first: an ambient value on the CI host or in a
+    developer shell must not skew outcomes. Then the explicitly listed
+    `unset` names (the python equivalent of `env -u NAME ...`), then
+    the overrides on top. An override whose value is None removes the
+    variable too, so parametrized matrices can express "set" and
+    "unset" in one dict -- a test that names a knob explicitly always
+    wins over the default-unset.
+    """
+    merged = dict(os.environ)
+    for name in list(merged):
+        if name.startswith(_AMBIENT_KNOB_PREFIXES) \
+                or name in _AMBIENT_KNOB_NAMES:
+            merged.pop(name)
+    for name in unset:
+        merged.pop(name, None)
+    if env:
+        for name, value in env.items():
+            if value is None:
+                merged.pop(name, None)
+            else:
+                merged[name] = str(value)
+    return merged
+
+
+def run(cmd, env=None, unset=(), cwd=None):
+    """Run a command with captured output; never raises on failure.
+
+    Real assertions and failure messages are the tests' job -- this
+    helper only keeps the invocation hermetic. A hung script (e.g. a
+    stub waiting on stdin that never arrives) fails the run after the
+    bounded timeout instead of hanging the suite.
+    """
+    argv = [str(part) for part in cmd]
+    return subprocess.run(
+        argv,
+        env=run_env(env, unset),
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+
+def write_executable(path, text):
+    """Write a stub script and make it executable."""
+    path.write_text(text)
+    os.chmod(path, 0o755)
+    return path
+
+
+def read_ini(path):
+    """Parse an ini file with configparser (never awk)."""
+    cfg = configparser.ConfigParser(interpolation=None)
+    read = cfg.read(str(path))
+    assert read, f"configparser could not read {path}"
+    return cfg
+
+
+def assert_ini_value(path, section, option, expected):
+    """Assert an ini value with a real failure message."""
+    cfg = read_ini(path)
+    assert cfg.has_option(section, option), \
+        f"missing ini option [{section}] {option}"
+    actual = cfg.get(section, option)
+    assert actual == expected, \
+        f"[{section}] {option}: expected {expected!r}, got {actual!r}"
+
+
+def ini_value(path, section, option):
+    """An ini value, or the empty string when absent."""
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(str(path))
+    return cfg.get(section, option, fallback="")
+
+
+def file_mode(path):
+    """The file mode as the symbolic string stat -c '%a' prints it."""
+    return format(stat.S_IMODE(os.stat(path).st_mode), "o")
+
+
+def assert_mode(path, expected):
+    """Assert a file mode, e.g. assert_mode(ini, "600")."""
+    actual = file_mode(path)
+    assert actual == expected, \
+        f"{path}: expected mode {expected}, got {actual}"
+
+
+def rmtree(path):
+    """Best-effort recursive removal (sandbox teardown)."""
+    shutil.rmtree(path, ignore_errors=True)
+
+
+# --- the selftest job's own vacuous-green guard (review QA-04) ---------
+# The Lint selftest job exits 0 on all-pass AND on a mass-skip (the
+# exit-5 no-tests-collected protection covers only the empty-tree
+# case). These helpers classify every recorded skip against the ONE
+# justified set, so a conftest hook can fail the session when skips
+# appear that nobody justified. Pure functions on plain data -- the
+# classification itself is pinned by test_selftest_skip_guard.py.
+
+# The only ever-justified skips, keyed by whether the tree is a
+# git-less copy (the mutation battery's tar-copy has no .git index,
+# so the two git-mode guard tests legitimately skip there; on a real
+# checkout -- where the Lint job runs -- NOTHING may skip).
+_mode_guard = ("test_plan_script_modes.py::TestPlanScriptModes::"
+               "test_the_plans_do_reference_scripts")
+_mode_guard_2 = ("test_plan_script_modes.py::TestPlanScriptModes::"
+                 "test_every_directly_invoked_script_is_executable")
+JUSTIFIED_SKIPS_GITLESS = (_mode_guard, _mode_guard_2)
+
+
+def unexpected_skips(skip_records, gitless):
+    """The (nodeid, reason) pairs nobody justified.
+
+    *skip_records* is an iterable of (nodeid, reason) tuples as
+    recorded from pytest skip reports. A record is justified when its
+    nodeid ends with one of the allowed entries for the mode
+    (gitless vs real checkout). The result preserves input order.
+    """
+    allowed = JUSTIFIED_SKIPS_GITLESS if gitless else ()
+    return [
+        (nodeid, reason)
+        for nodeid, reason in skip_records
+        if not any(nodeid.endswith(entry) for entry in allowed)
+    ]
