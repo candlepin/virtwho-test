@@ -6,15 +6,22 @@
 ; In CI this file is NOT used directly: virtwho.ini is generated at
 ; test time on tmpfs (/dev/shm/virtwho.ini, mode 0600) by
 ; systemtest/scripts/generate-virtwho-ini.sh. The generator downloads
-; a sanitized base ini from VIRTWHO_INI_URL (a plain, non-secret
-; Testing Farm variable; the file holds non-secret values only) and
-; overlays the VIRTWHO_* environment variables delivered as CI secrets
-; (usernames, passwords, tokens, keytabs and SSH keys come ONLY from
-; there). When VIRTWHO_INI_URL is unset the complete ini is generated
-; from the VIRTWHO_* secrets alone. The test tree holds only a symlink
-; to the tmpfs file, and systemtest/scripts/cleanup-secrets.sh destroys
-; it in the tmt finish step. See README.rst for the environment
-; variable contract.
+; a base ini from VIRTWHO_INI_URL (a plain, non-secret Testing Farm
+; variable; non-secret values, plus optional
+; "@vault:<mount>/<path>:<key>" sentinel values in the credential-
+; shaped option slots), resolves the sentinels of the active cell's
+; sections from Vault, and overlays the VIRTWHO_* environment
+; variables delivered as CI secrets (the environment always wins).
+; Usernames, passwords, tokens, keytabs and SSH keys come only from
+; those variables or from Vault via sentinels -- never as plaintext
+; in a downloaded or committed file. A sentinel in [virtwho], [job]
+; or a pass-through section aborts the generator: those values come
+; only from the VIRTWHO_* environment variables, never from Vault.
+; When VIRTWHO_INI_URL is unset
+; the complete ini is generated from the VIRTWHO_* secrets alone.
+; The test tree holds only a symlink to the tmpfs file, and
+; systemtest/scripts/cleanup-secrets.sh destroys it in the tmt finish
+; step. See README.rst for the environment variable contract.
 ;
 ; When deriving a sanitized base ini from this sample, DELETE every
 ; credential-shaped line (username/password/token/keytab/secret, key,

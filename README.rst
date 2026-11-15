@@ -22,30 +22,58 @@ credentials at rest: it is generated at test time on tmpfs
 ``systemtest/scripts/generate-virtwho-ini.sh`` and destroyed by
 ``systemtest/scripts/cleanup-secrets.sh`` in the tmt finish step.
 That contract is enforced, not assumed: a downloaded base containing
-a credential-shaped option (any ``*username*``/``*password*``/
-``*token*``/``*keytab*``/``*secret*`` or key-material option) aborts
-the generator, and a ``VIRTWHO_*`` variable under a known section
-prefix that matches no known option (e.g. a typo like
+a **plaintext or empty** credential-shaped option (any
+``*username*``/``*password*``/``*token*``/``*keytab*``/``*secret*`` or
+key-material option) aborts the generator -- the one allowed value
+form for those options is a ``@vault:`` sentinel, resolved guest-side
+from Vault (below) -- and a ``VIRTWHO_*`` variable under a known
+section prefix that matches no known option (e.g. a typo like
 ``VIRTWHO_ESX_GUEST_IPS``) prints a stderr warning instead of being
 silently dropped.
 
 How the ini is assembled:
 
 1. **Base download (primary mode)**: when ``VIRTWHO_INI_URL`` is set,
-   the generator downloads the sanitized base ini it points at. The
-   variable is a *plain* (non-secret) Testing Farm variable and the
-   file contains ONLY non-secret values (server hostnames/IPs, ports,
+   the generator downloads the base ini it points at. The variable is
+   a *plain* (non-secret) Testing Farm variable and the file contains
+   ONLY non-secret values (server hostnames/IPs, ports,
    domains/clusters, guest names, stable UUIDs, org IDs,
-   repo/brew/proxy hosts, manifest/dogfood URLs). It must never point
-   at a file containing credentials.
-2. **Env-secret overlay (env wins)**: the ``VIRTWHO_*`` environment
+   repo/brew/proxy hosts, manifest/dogfood URLs) plus, optionally,
+   ``@vault:<mount>/<path>:<key>`` sentinel values in the
+   credential-shaped option slots. ``<mount>`` is the Vault kv2 mount
+   name (part of the grammar: ``@vault:cct-ci/...:key`` without the
+   mount is a grammar error). It must never point at a file containing
+   *plaintext* credentials -- that aborts the generator.
+2. **Sentinel resolution (guest-side, selective)**: the sentinels of
+   the ACTIVE sections only -- the active hypervisor's section, the
+   register section, and every entry of the effective
+   ``multi_hypervisors`` list -- are resolved from the Vault kv2
+   server into the tmpfs ini, so the credentials of the other
+   hypervisor families are never materialized on a guest that does
+   not need them (their sentinels stay as literal path values).
+   Vault access comes from the environment: ``VAULT_ADDR`` (must be
+   ``https``; ``VAULT_ALLOW_HTTP=1`` is a loopback/self-test opt-out)
+   plus either ``VAULT_TOKEN`` or the AppRole pair
+   ``VAULT_ROLE_ID``/``VAULT_SECRET_ID``; ``VAULT_SKIP_VERIFY``
+   skips TLS validation (insecure, self-signed labs). An env-supplied
+   credential is final and never resolved, so a Vault outage cannot
+   block a cell whose active credentials are all env-supplied. A
+   sentinel that still needs resolution and fails (missing key, Vault
+   error) aborts the run naming the path and key; the same holds when
+   no Vault credentials are set at all. ``VIRTWHO_VAULT_REQUIRED=1``
+   additionally requires Vault credentials whenever the base carries
+   any sentinel, even outside the active sections. A sentinel in
+   ``[virtwho]``, ``[job]`` or a pass-through section aborts; those
+   values come only from the ``VIRTWHO_*`` environment.
+3. **Env-secret overlay (env wins)**: the ``VIRTWHO_*`` environment
    variables, delivered as CI secrets, are
-   overlaid on top of the base (or, when ``VIRTWHO_INI_URL`` is unset,
-   they build the complete ini alone -- the backward-compatible
-   fallback). Usernames, passwords, tokens, keytabs and SSH keys come
-   ONLY from these variables, never from any downloaded or committed
+   overlaid on top of the resolved base (or, when ``VIRTWHO_INI_URL``
+   is unset, they build the complete ini alone -- the
+   backward-compatible fallback). Usernames, passwords, tokens,
+   keytabs and SSH keys come only from these variables or from Vault
+   via sentinels -- never as plaintext in any downloaded or committed
    file.
-3. **Computed values**: values computed during the run (the resolved
+4. **Computed values**: values computed during the run (the resolved
    compose, the virt-who NEVRA, gating ``test_rpms``, the kubevirt
    guest coordinates) are recorded in the non-secret sidecar
    ``.virtwho-computed.ini`` and merged back by ``run-tests.sh`` when
@@ -68,6 +96,24 @@ than run credless -- a deliberate, *loud* cutover, not a silent mode
 change. Once both are in, the virt-who default runs work end to end.
 ``HTTPS_PROXY``/``VIRTWHO_REPO`` are delivered the same way by the
 follow-up MR **!560** (rhsm-jobs, merged 2026-11-19; see below).
+
+Accepted supply risk, stated plainly (review PR298-23): the served
+base is fetched over plain ``http://`` with no transport check --
+an asymmetry, since the credential resolver itself refuses a
+non-``https`` ``VAULT_ADDR`` (unless ``VAULT_ALLOW_HTTP=1``). The
+base selects where resolved credentials are *sent*, so the fetch is
+part of the trust path. The accepted bound: the served location is
+an internal-only host (not reachable from outside the corp network),
+the base is structure-validated on arrival (the credential-name
+filter aborts any plaintext credential, and sentinels are only ever
+resolved for the active sections), and the credentials themselves
+travel Vault → guest over TLS -- only non-secret structure rides the
+plain-http leg. Stronger options are future hardening, not current
+behavior: enforcing ``https`` for ``VIRTWHO_INI_URL`` (it would break
+the live supply, which serves plain http by design) and the optional
+``VIRTWHO_INI_SHA256`` digest pin -- already implemented: when set
+(a plain, non-secret hex digest), the generator verifies the
+downloaded base against it and aborts on a mismatch.
 
 Single materialization point: the ini exists ONLY on tmpfs. The test
 tree (``/opt/virtwho-test`` / ``/usr/share/virtwho-test``, and the
@@ -205,8 +251,34 @@ Notes:
   wires the sections into the generator table and the environment
   contract.
 
+Vault delivery (for the ``@vault:`` sentinels of the base ini; all
+optional, all delivered as Testing Farm secrets except where noted):
+
+===================================  =============================
+Environment variable                 Purpose
+===================================  =============================
+``VAULT_ADDR``                       Vault server address (must be
+                                     ``https``; set
+                                     ``VAULT_ALLOW_HTTP=1`` only for
+                                     loopback/self-test servers)
+``VAULT_TOKEN``                      static token, or:
+``VAULT_ROLE_ID`` +                  AppRole login (the CI form)
+``VAULT_SECRET_ID``
+``VAULT_SKIP_VERIFY``                skip TLS validation (insecure)
+``VIRTWHO_VAULT_REQUIRED``           strict mode: require
+                                     **usable** Vault credentials
+                                     (address present; ``https``
+                                     unless ``VAULT_ALLOW_HTTP=1``)
+                                     for any sentinel in the base,
+                                     active or not
+===================================  =============================
+
+``VIRTWHO_INI_URL`` itself is a *plain* (non-secret) Testing Farm
+variable.
+
 Self-test for the generator and the tmpfs/symlink/ssh_config plumbing
-(no real credentials involved)::
+(no real credentials involved; runs on every push and pull request in
+the ``Lint`` workflow's ``selftest`` job, and can be run manually)::
 
     bash systemtest/scripts/test-generate-virtwho-ini.sh
 

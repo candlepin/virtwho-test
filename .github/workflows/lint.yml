@@ -15,3 +15,18 @@ jobs:
           python-version: "3.12"
       - run: pip install ruff
       - run: ruff check .
+
+  # The generator self-test is the functional evidence for the
+  # base-ini security contract (plaintext-credential scan, selective
+  # sentinel resolution, redirect refusal, the no-credentials gate).
+  # It is hermetic: mktemp under /dev/shm, a fake Vault on loopback
+  # with obviously-fake values, no credentials, no egress -- so it
+  # runs on every push and pull request like the lint job. It is a
+  # host-side harness, deliberately NOT part of the Testing Farm
+  # guest plans.
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the generate-virtwho-ini self-test
+        run: bash systemtest/scripts/test-generate-virtwho-ini.sh
