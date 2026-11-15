@@ -1,20 +1,44 @@
 #!/bin/bash
 # generate-virtwho-ini.sh -- Generate a virtwho.ini on tmpfs.
 #
-# Primary mode (VIRTWHO_INI_URL set): download the sanitized base ini
+# Primary mode (VIRTWHO_INI_URL set): download the base ini
 # from VIRTWHO_INI_URL and overlay the VIRTWHO_* environment secrets on
 # top -- the environment always wins. VIRTWHO_INI_URL is a PLAIN
-# (non-secret) Testing Farm variable pointing at a sanitized base ini
-# provided by CI, which contains ONLY non-secret values (server
-# hostnames/IPs, ports, domains/clusters, guest names, stable UUIDs,
-# org IDs, repo/brew/proxy hosts, manifest/dogfood URLs). It must NEVER
-# point at a file containing credentials: usernames, passwords, tokens,
-# keytabs and SSH keys come exclusively from the VIRTWHO_* environment
-# secrets (delivered as CI secrets). This contract is ENFORCED, not
-# assumed: after download, any credential-shaped option found in the
-# base (username/password/token/keytab/secret or key-material shapes)
-# aborts the run -- the served file is secret-free, so a violation
-# means VIRTWHO_INI_URL points at the wrong file.
+# (non-secret) Testing Farm variable pointing at a base ini provided
+# by CI, which contains ONLY non-secret values (server hostnames/IPs,
+# ports, domains/clusters, guest names, stable UUIDs, org IDs,
+# repo/brew/proxy hosts, manifest/dogfood URLs) plus, optionally,
+# "@vault:<mount>/<path>:<key>" sentinel values in the credential-shaped
+# option slots (username/password/token/keytab/secret, key, *_key) --
+# <mount> is the Vault kv2 mount name, part of the sentinel grammar.
+# It must NEVER point at a file containing PLAINTEXT credentials: any
+# credential-shaped option whose value is not an @vault: sentinel
+# aborts the run -- the served file is plaintext-credential-free, so a
+# violation means VIRTWHO_INI_URL points at the wrong file.
+#
+# Sentinels are resolved GUEST-SIDE, after the download and before the
+# env overlay, from a Vault kv2 server (systemtest/scripts/
+# vault_resolve.py), for the ACTIVE sections only -- the active
+# hypervisor's section, the register section, and every entry of the
+# effective multi_hypervisors list (multi-hypervisor cells consume
+# every family in the list; the normalized list is written back into
+# [job] multi_hypervisors, because the suite re-parses that value
+# without normalizing it) -- so the credentials of the other
+# hypervisor families are never materialized on a guest that does not
+# need them. A sentinel in any OTHER section ([virtwho], [job], the
+# pass-through sections) aborts the run: those values must come from
+# the VIRTWHO_* environment, never from Vault. Vault credentials come from the environment: VAULT_ADDR
+# (https) plus VAULT_TOKEN, or VAULT_ROLE_ID and VAULT_SECRET_ID (an
+# AppRole) -- all delivered as Testing Farm secrets (the environment
+# is how Testing Farm hands decrypted blob values to the guest).
+# Env-supplied credentials are final and never resolved, so a Vault
+# outage cannot block a cell whose active credentials are all
+# env-supplied; a sentinel that still needs resolution without Vault
+# credentials aborts the run (a credentialed cell must not silently
+# run credless; unset VIRTWHO_INI_URL for a local/dev, env-only run);
+# VIRTWHO_VAULT_REQUIRED=1 additionally requires the credentials
+# whenever the base carries any sentinel at all. Env secrets still WIN
+# over resolved values, preserving the CI override.
 #
 # Fallback mode (VIRTWHO_INI_URL unset): generate the complete ini from
 # the VIRTWHO_* environment variables alone.
@@ -94,6 +118,7 @@
 # This script never prints credential values.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT=${1:-/dev/shm/virtwho.ini}
 # Single materialization (review PR297-10): when OUTPUT is a symlink
 # (the test tree's view of the tmpfs ini), resolve it and write
@@ -131,6 +156,10 @@ if [ -z "${RHEL_COMPOSE:-}" ] && [ -n "${VIRTWHO_JOB_RHEL_COMPOSE:-}" ]; then
     export RHEL_COMPOSE
 fi
 HYP=$(printf '%s' "${HYPERVISOR:-esx}" | tr '[:upper:]' '[:lower:]')
+# REGISTER is normalised like HYP: a mixed-case value would otherwise
+# match no ini section and silently skip the register section's
+# sentinel resolution.
+REGISTER=$(printf '%s' "${REGISTER:-rhsm}" | tr '[:upper:]' '[:lower:]')
 
 # Legacy alias: KUBEVIRT_TOKEN maps onto VIRTWHO_KUBEVIRT_TOKEN (the
 # new name wins when both are set). run-tests.sh regenerates the ini
@@ -182,14 +211,32 @@ if [ -n "${VIRTWHO_INI_URL:-}" ]; then
         exit 1
     fi
     echo "Downloaded sanitized base ini from VIRTWHO_INI_URL"
+    # Optional integrity pin (review PR298-23): when VIRTWHO_INI_SHA256
+    # is set (a plain, non-secret hex digest), verify the downloaded
+    # base against it and abort on a mismatch -- the base selects
+    # where resolved credentials are sent, so tampering must not pass
+    # silently. Unset means unpinned; the accepted-risk posture of the
+    # plain-http supply (and the stronger future options) is stated in
+    # README.rst.
+    if [ -n "${VIRTWHO_INI_SHA256:-}" ]; then
+        ACTUAL_SHA256=$(sha256sum "$BASE_FILE" | awk '{print $1}')
+        if [ "$ACTUAL_SHA256" != "$VIRTWHO_INI_SHA256" ]; then
+            echo "ERROR: the downloaded base ini does not match VIRTWHO_INI_SHA256 (got ${ACTUAL_SHA256}, expected ${VIRTWHO_INI_SHA256})" >&2
+            exit 1
+        fi
+        echo "Base ini matches the VIRTWHO_INI_SHA256 pin"
+    fi
 fi
 
 umask 077
 HYP=$HYP REGISTER=${REGISTER:-rhsm} RHEL_COMPOSE=${RHEL_COMPOSE:-} \
+    PYTHONPATH="${SCRIPT_DIR}" \
     python3 - "$TMP_OUTPUT" "$BASE_FILE" <<'PYEOF'
 import configparser
 import os
 import sys
+
+import vault_resolve
 
 out_path = sys.argv[1]
 base_path = sys.argv[2]
@@ -314,11 +361,16 @@ if base_path:
               file=sys.stderr)
         sys.exit(1)
 
-    # The base is contractually secret-free. Any credential-shaped
-    # option means VIRTWHO_INI_URL points at the wrong file (e.g. the
-    # old pre-split ini) -- abort loudly instead of passing the value
-    # through, even if an env secret would have overridden it.
-    def forbidden_option(opt):
+    # The base must be free of PLAINTEXT credentials. Credential-shaped
+    # option names (username/password/token/keytab/secret, key and
+    # *_key -- this catches activation_key) are allowed ONLY with
+    # @vault: sentinel values, resolved guest-side from Vault for the
+    # active sections (see below). A plaintext value in a
+    # credential-shaped option means VIRTWHO_INI_URL points at the
+    # wrong file (e.g. the old pre-split ini) -- abort loudly instead
+    # of passing the value through, even if an env secret would have
+    # overridden it.
+    def credential_option(opt):
         o = opt.lower().replace("-", "_")
         if any(s in o for s in ("username", "password", "token", "keytab",
                                 "secret")):
@@ -328,14 +380,144 @@ if base_path:
 
     offenders = ["[%s] %s" % (sec, opt)
                  for sec in cfg.sections() for opt in cfg.options(sec)
-                 if forbidden_option(opt)]
+                 if credential_option(opt)
+                 and not vault_resolve.is_sentinel(cfg.get(sec, opt))]
     if offenders:
         for off in offenders:
             print("ERROR: the downloaded base ini contains a forbidden "
                   "credential option: %s" % off, file=sys.stderr)
-        print("ERROR: the base ini must be secret-free; credentials come "
-              "from the VIRTWHO_* environment secrets", file=sys.stderr)
+        print("ERROR: credential-shaped options in the base ini are only "
+              "allowed with @vault: sentinel values; plaintext credentials "
+              "must never be served -- they come from the VIRTWHO_* "
+              "environment secrets or from Vault", file=sys.stderr)
         sys.exit(1)
+
+    # --- Sentinel resolution (guest-side credential pull) ---
+    # Resolve the sentinels of the ACTIVE sections only: the active
+    # hypervisor's section, the register section and the entries of
+    # the effective multi_hypervisors list. The base ini carries the
+    # credential slots of every family, but a guest must only ever
+    # materialize the credentials of its own cell -- the sentinels of
+    # the non-active sections are left as literal @vault: values (they
+    # name Vault paths, not secrets).
+    # multi_hypervisors cells consume every family in the list, so
+    # those sections are active too. VIRTWHO_JOB_MULTI_HYPERVISORS
+    # wins (the env overlay would overwrite the base value anyway);
+    # parsed like the suite's hypervisors_list() -- bracketed,
+    # comma-separated -- but also strip()ped and lower()cased, because
+    # the section names are lowercase and the suite's parser keeps
+    # the spaces ('esx, rhevm' yields ' rhevm'). The normalized list
+    # is written back into [job] after the overlay (see below), so
+    # the suite's unnormalized re-parse sees the same entries.
+    multi_raw = os.environ.get("VIRTWHO_JOB_MULTI_HYPERVISORS", "")
+    if not multi_raw.strip() and cfg.has_option("job", "multi_hypervisors"):
+        multi_raw = cfg.get("job", "multi_hypervisors")
+    # strip the OUTER whitespace before the brackets: str.strip("[")
+    # strips a character set from both ends, so ' [libvirt] ' would
+    # otherwise keep a bracket, match no section and silently drop the
+    # family
+    multi_raw = multi_raw.strip()
+    if multi_raw.startswith("[") and multi_raw.endswith("]"):
+        multi_raw = multi_raw[1:-1]
+    active_sections = []
+    for name in (hyp, register) + tuple(
+            entry.strip().lower()
+            for entry in multi_raw.split(",")):
+        if name and name not in active_sections:
+            active_sections.append(name)
+
+    # Env-supplied credentials are final: an option whose sentinel the
+    # environment already overrides is never resolved, so a Vault
+    # outage cannot block a cell whose active credentials are all
+    # env-supplied (the env overlay applies them after this anyway).
+    # The prefixes follow the overlay's own rule below.
+    def overlay_prefixes(section):
+        if section in TABLE:
+            return TABLE[section][0]
+        return [section.upper().replace("-", "_")]
+
+    targets = []
+    for section in active_sections:
+        if not cfg.has_section(section):
+            continue
+        for option in cfg.options(section):
+            value = cfg.get(section, option)
+            if not vault_resolve.is_sentinel(value):
+                continue
+            if env_value(overlay_prefixes(section), option):
+                continue  # the env overlay will win; never resolve it
+            targets.append((section, option))
+    target_sections = sorted({section for section, _ in targets})
+
+    resolver = vault_resolve.VaultResolver()
+    sentinel_sections = vault_resolve.sections_with_sentinels(cfg)
+
+    # A sentinel in a section that is never resolved is a base-authoring
+    # error: [virtwho], [job] and the pass-through sections take their
+    # values from the VIRTWHO_* environment variables, and a literal
+    # @vault: string would silently become the credential (the
+    # run-tests.sh merge-back only fills EMPTY options, so nothing
+    # catches it later). The hypervisor families and the two register
+    # sections are the per-cell credential slots: their sentinels stay
+    # literal when the cell does not use them, by design.
+    resolvable_sections = set(
+        name for name in TABLE if name not in ("job", "virtwho"))
+    unsupported = [
+        (section, option)
+        for section in sorted(sentinel_sections - resolvable_sections)
+        for option in cfg.options(section)
+        if vault_resolve.is_sentinel(cfg.get(section, option))
+    ]
+    for section, option in unsupported:
+        print("ERROR: the base ini carries a sentinel in the unsupported"
+              " section [%s] (option %s): values for this section must"
+              " come from the VIRTWHO_* environment variables, never"
+              " from Vault" % (section, option), file=sys.stderr)
+    if unsupported:
+        sys.exit(1)
+
+    if targets or (resolver.strict and sentinel_sections):
+        if not resolver.configured:
+            if targets:
+                print("ERROR: the base ini carries @vault: sentinels in "
+                      "the active section(s) %s that the environment does "
+                      "not override, but no Vault credentials are set "
+                      "(VAULT_TOKEN, or VAULT_ROLE_ID and VAULT_SECRET_ID): "
+                      "a credentialed cell must not silently run credless. "
+                      "For a local/dev run without Vault, unset "
+                      "VIRTWHO_INI_URL to generate the ini from the "
+                      "VIRTWHO_* environment alone"
+                      % ", ".join("[%s]" % s for s in target_sections),
+                      file=sys.stderr)
+            else:
+                print("ERROR: VIRTWHO_VAULT_REQUIRED is set and the base "
+                      "ini carries @vault: sentinels, but no Vault "
+                      "credentials are set (VAULT_TOKEN, or VAULT_ROLE_ID "
+                      "and VAULT_SECRET_ID)", file=sys.stderr)
+            sys.exit(1)
+        if targets:
+            try:
+                count = vault_resolve.resolve_options(cfg, targets, resolver)
+            except vault_resolve.VaultError as error:
+                print("ERROR: %s" % error, file=sys.stderr)
+                sys.exit(1)
+            print("Resolved %d Vault sentinel(s) in the active section(s): %s"
+                  % (count, ", ".join(target_sections)))
+        else:
+            # strict mode with no target: verify the credentials are
+            # actually usable (present, addressed, https), not merely
+            # present -- "requires credentials" must not be satisfied
+            # by a token that cannot reach any server
+            try:
+                resolver.check_usable()
+            except vault_resolve.VaultError as error:
+                print("ERROR: VIRTWHO_VAULT_REQUIRED is set but the Vault"
+                      " credentials are unusable: %s" % error, file=sys.stderr)
+                sys.exit(1)
+            print("VIRTWHO_VAULT_REQUIRED set: Vault credentials present"
+                  " and usable (address checked -- no Vault request is"
+                  " made until an active-section sentinel needs"
+                  " resolution)")
 
 # Warn about VIRTWHO_* variables that map to no known option: a typo
 # like VIRTWHO_ESX_GUEST_IPS would otherwise be silently dropped and
@@ -390,7 +572,9 @@ for name, (prefixes, options) in TABLE.items():
 
 # Env-secret overlay: the environment (CI secrets) always wins, both
 # for table options and for options that only exist in the base ini
-# (e.g. extra options of the sanitized file).
+# (e.g. extra options of the sanitized file) -- and over the values
+# resolved from @vault: sentinels above, which preserves the CI-side
+# override of any credential during the transition.
 for name in cfg.sections():
     if name in TABLE:
         prefixes = TABLE[name][0]
@@ -459,6 +643,25 @@ for option, default in PLAN_LEVEL.items():
               % (option.upper(), option.upper(), option.upper()),
               file=sys.stderr)
     cfg.set("job", option, default)
+
+# The suite re-parses [job] multi_hypervisors with its own,
+# unnormalized expression (virtwho/base.py hypervisors_list():
+# strip("[").strip("]").split(",")), and get_hypervisor_handler()
+# compares each entry RAW against the mode list, falling back to the
+# [esx] handler for anything else: a spaced or mixed-case value would
+# resolve the right credentials above but drive the WRONG handler in
+# the suite. Write the NORMALIZED list back into the ini after the
+# overlay (env value or base value -- the same parse as the
+# active-sections computation above), so both ends agree.
+if cfg.has_option("job", "multi_hypervisors"):
+    multi_norm = cfg.get("job", "multi_hypervisors").strip()
+    if multi_norm:
+        if multi_norm.startswith("[") and multi_norm.endswith("]"):
+            multi_norm = multi_norm[1:-1]
+        entries = [entry.strip().lower() for entry in multi_norm.split(",")]
+        cfg.set("job", "multi_hypervisors",
+                "[%s]" % ",".join(entry for entry in entries if entry))
+
 
 with open(out_path, "w") as f:
     cfg.write(f, space_around_delimiters=False)
