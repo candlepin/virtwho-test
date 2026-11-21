@@ -229,8 +229,8 @@ def beaker_job_report(job_id):
 def beaker_client_kinit(keytab, principal):
     """
     Initiate beaker client.
-    :param keytab: jenkins keytab
-    :param principal: jenkins principal
+    :param keytab: CI keytab
+    :param principal: CI principal
     :return: True/False
     """
     ret, _output = run_cmd(f"kinit -k -t {keytab} {principal}")

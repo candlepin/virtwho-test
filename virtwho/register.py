@@ -7,6 +7,7 @@ import requests
 
 from virtwho import FailException, logger
 from virtwho.configure import get_register_handler
+from virtwho.destination import api_base
 from virtwho.ssh import SSHConnect
 
 
@@ -45,7 +46,11 @@ class SubscriptionManager:
         self.org = org or register.default_org
         self.activation_key = activation_key
         if register_type != "satellite":
-            self.baseurl = register.baseurl
+            # getattr: a hand-written ini without the option must not
+            # crash here (the generator always emits baseurl since the
+            # container-tier fold, but the suite also supports
+            # hand-written local inis).
+            self.baseurl = getattr(register, "baseurl", "")
 
     def register(self):
         """
@@ -64,8 +69,12 @@ class SubscriptionManager:
                 cmd += f"--username={self.username} --password={self.password} "
             if self.register_type == "satellite":
                 self.satellite_cert_install()
-            else:
+            elif self.baseurl:
                 cmd += f"--baseurl={self.baseurl}"
+            # an empty baseurl (a hand-written ini without the option)
+            # omits the flag: subscription-manager then uses its
+            # rhsm.conf default instead of registering against
+            # "--baseurl=" (an empty value).
             _ret, output = self.ssh.runcmd(cmd)
             if "The system has been registered" in output:
                 logger.info(f"Succeeded to register host({self.host})")
@@ -153,10 +162,10 @@ class SubscriptionManager:
         subscription-manager identity
         ... returns dict
         aka
-        {'system identity': '29dadce5-0d6b-44ed-bf35-71e1943e4129',
-         'name': 'kvm-06.redhat.com',
-         'org name': '18939614',
-         'org ID': '18939614'}
+        {'system identity': '00000000-0000-0000-0000-000000000000',
+         'name': 'kvm.example.com',
+         'org name': '12345678',
+         'org ID': '12345678'}
         """
         cmd = "subscription-manager identity"
         ret, output = self.ssh.runcmd(cmd)
@@ -176,7 +185,12 @@ class RHSM:
         """
         register = get_register_handler(rhsm)
         self.org = register.default_org
-        self.api = f"https://{register.server}/subscription"
+        # Prefix- and port-aware (CCT-3155): the containerized
+        # Candlepin destination serves /candlepin on 8443; the stage
+        # tier keeps /subscription on the default port. The values
+        # come from the ini (falling back to the historical
+        # defaults), never from a hardcoded prefix.
+        self.api = api_base(register.server, register.port, register.prefix)
         self.auth = (register.username, register.password)
 
     def consumers(self, host_name=None):

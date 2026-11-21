@@ -1,0 +1,81 @@
+# candlepin-pod.yaml -- Vendored, digest-pinned deployment of the
+# containerized Candlepin destination (CCT-3155).
+#
+# Vendored from candlepin-container-unofficial's candlepin-pod.yaml
+# with the :latest tags replaced by the @sha256: digests resolved on
+# 2026-11-20. Pinning is deliberate: the :latest tags are republished
+# on every upstream main build, and the pre-baked test data contract
+# (the snowwhite org, the testuser1 roles, the SCA-capable owners)
+# must not silently change under a test run -- refresh the digests
+# deliberately (record the date here when you do).
+#
+# Usage (see systemtest/scripts/prepare-candlepin.sh):
+#   podman play kube candlepin-pod.yaml         # start
+#   podman play kube candlepin-pod.yaml --down  # stop
+#
+# The two containers share the pod's network namespace: Candlepin
+# reaches PostgreSQL at localhost:5432. The app's TLS listener is
+# published on hostPort 8443 (>1024: no privileged ports, no
+# sysctls). The two env vars override the db_host baked into
+# candlepin.conf.
+#
+# NO repo container (owner ruling, run #7 follow-up, 2026-11-21):
+# virt-who tests virt-who's REPORTING, not content consumption --
+# nothing in the suite installs from or asserts on the destination's
+# content repos (verified by grep; the package tests' version under
+# test comes from TEST_RPMS or the compose, never the destination).
+# Port 8080 is therefore deliberately NOT bound: the tier's [rhsm]
+# baseurl keeps pointing at http://localhost:8080, which keeps
+# content access LOCAL (no external egress -- subscription-manager
+# must never fall back to the real CDN) while every content
+# operation against it fails bounded and locally (connection
+# refused, ~1 s, verified live). This also drops one of the three
+# ghcr pulls (less exposure to the concurrent-pull stalls observed
+# in run #7's build #181).
+#
+# Startup ordering (rhsm-qe LESSON-05, assessed): both containers
+# start simultaneously -- podman play kube cannot express
+# intra-pod ordering (a kube initContainer runs before the WHOLE
+# pod's regular containers, so a pg_isready gate would deadlock
+# against the db container it waits for; only splitting the db out
+# of the pod, rhsm-qe's shape, would gate cleanly). The race is
+# survivable and non-silent in practice: the upstream publish gate
+# (build.sh smoke_test) cold-starts db+app together on a fresh
+# network and polls /status up to 300 s on every image publish;
+# podman play kube's default container restart policy is "always"
+# (an app that exits on the race is restarted onto an up db); and
+# PostgreSQL with baked PGDATA starts in ~1-2 s while the Tomcat JVM
+# needs 10-30 s to reach webapp deploy. Should the pathological case
+# ever hit, prepare-candlepin.sh fails loudly (HTTP-200-only
+# readiness + the assert-candlepin-tier.sh run guard), never a
+# vacuous green.
+#
+# The images are PUBLIC ghcr.io test images carrying SYNTHETIC test
+# data only (pre-baked orgs/users/products of the Candlepin test
+# suite) -- public-by-design, no registry credentials needed.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: candlepin
+  labels:
+    app: candlepin
+spec:
+  containers:
+    - name: candlepin-db
+      image: ghcr.io/candlepin/candlepin-db@sha256:4bf8b27d20fa77d2afff60723ce2ed5058e2337cbf26b2db81f116fe956b5d5b
+      ports:
+        - containerPort: 5432
+          protocol: TCP
+
+    - name: candlepin-app
+      image: ghcr.io/candlepin/candlepin-app@sha256:bba274fd2af841bcf15ef5d975f4d99902a58e1599eae6e95017d4f2ac3751a3
+      env:
+        - name: JPA_CONFIG_HIBERNATE_CONNECTION_URL
+          value: jdbc:postgresql://localhost/candlepin
+        - name: ORG_QUARTZ_DATASOURCE_MYDS_URL
+          value: jdbc:postgresql://localhost/candlepin
+      ports:
+        - containerPort: 8443
+          hostPort: 8443
+          protocol: TCP

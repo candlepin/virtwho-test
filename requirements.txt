@@ -1,5 +1,6 @@
 # The below packages are required to run this project
-# Other required packages could be found in the Dockerfile, such as https://gitlab.cee.redhat.com/virtwho/virtwho-jobs/-/blob/master/docker/fedora/Dockerfile-fedora39
+# Other required packages could be found in the Dockerfile of the container
+# image used by the CI pipelines (see the CI pipelines repository)
 # Line beginning with 'RUN yum -y install '
 pytest==7.2.2
 pytest-xdist

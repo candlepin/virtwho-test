@@ -83,14 +83,14 @@ def satellite_repo_enable_snap(sm, ssh, rhel_ver, sat_ver, snap_ver):
         sm.repo("enable", f"rhel-{rhel_ver}-server-ansible-2.9-rpms")
 
     ssh.runcmd(
-        "curl -o /etc/pki/ca-trust/source/anchors/satellite-sat-engineering-ca.crt "
-        "http://satellite.sat.engineering.redhat.com/pub/katello-server-ca.crt; "
+        "curl -o /etc/pki/ca-trust/source/anchors/satellite-lab-ca.crt "
+        "http://satellite.example.invalid/pub/katello-server-ca.crt; "
         "update-ca-trust"
     )
 
     ret, _ = ssh.runcmd(
         f"curl -o /etc/yum.repos.d/satellite-capsule.repo "
-        f"http://ohsnap.sat.engineering.redhat.com/api/releases/"
+        f"http://ohsnap.example.invalid/api/releases/"
         f"{sat_ver}.0/snaps/{snap_ver}/el{rhel_ver}/satellite/repo_file"
     )
 

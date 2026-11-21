@@ -7,6 +7,12 @@ description: |
 environment:
     HYPERVISOR: libvirt
     REGISTER: rhsm
+    # Destination tier (CCT-3155): container (default) deploys the
+    # containerized Candlepin pod per run (prepare-candlepin.sh) and
+    # the generator fills [rhsm] with the synthetic container values;
+    # stage restores the sentinel/env flow for the scheduled
+    # fidelity tier. Stated here so the plan documents the default.
+    VIRTWHO_DESTINATION: container
 
 prepare:
     - name: Install dependencies
@@ -24,6 +30,10 @@ prepare:
     - name: Setup virtwho-test
       how: shell
       script: ./systemtest/scripts/setup-virtwho-test.sh
+
+    - name: Deploy containerized Candlepin destination
+      how: shell
+      script: ./systemtest/scripts/prepare-candlepin.sh
 
 discover:
     how: shell

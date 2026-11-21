@@ -15,6 +15,7 @@ from tests.conftest import wait_for_consumer
 from virtwho import HYPERVISOR, REGISTER, logger
 from virtwho.base import hostname_get
 from virtwho.configure import hypervisor_create
+from virtwho.destination import api_base
 from virtwho.settings import config
 
 
@@ -142,10 +143,24 @@ class TestHypervisorPositive:
             ):
                 proxy_env_statement = f"https_proxy=http://{config.rhsm.proxy_hostname}:{config.rhsm.proxy_port}"
 
+            # The container tier's destination is the per-run
+            # Candlepin pod on this host: the pipeline env's
+            # HTTPS_PROXY (and any stage proxy statement above)
+            # must not route this pod-facing curl through a proxy
+            # that can never reach the guest's own ports (the
+            # build-#179 class). The bypass is scoped to the
+            # destination host only.
+            noproxy_statement = ""
+            if getattr(config.job, "destination", "") == "container":
+                noproxy_statement = (
+                    f"--noproxy {register_data['server']}"
+                )
+
             cmd = (
                 f"{proxy_env_statement} curl -s -k -u "
                 f"{register_data['username']}:{register_data['password']} "
-                f"https://{register_data['server']}/subscription/"
+                f"{noproxy_statement} "
+                f"{api_base(register_data['server'], register_data['port'], register_data['prefix'])}/"
                 f"consumers/{hypervisor_uuid}/guestids/{guest_uuid}"
             )
 

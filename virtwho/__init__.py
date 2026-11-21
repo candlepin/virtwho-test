@@ -49,6 +49,15 @@ VIRTWHO_PKG = config.virtwho.package
 
 TEST_RPMS = getattr(config.virtwho, "test_rpms", "") or os.environ.get("TEST_RPMS", "")
 
+# The version-under-test RPM cache (the run-#7 content-gap fix):
+# setup-virtwho-test.sh downloads the version under test (from
+# TEST_RPMS when set -- precedence; else the compose's own virt-who)
+# into the test tree BEFORE any registration can switch the host's
+# content sources, and records the path here through the computed
+# sidecar. Empty when the cache could not be written (the install
+# helper then falls back to the TEST_RPMS URL or the enabled repos).
+VIRTWHO_UNDERTEST_RPM = getattr(config.virtwho, "undertest_rpm", "") or ""
+
 VIRTWHO_VERSION = ""
 if VIRTWHO_PKG:
     parts = VIRTWHO_PKG.split("-")

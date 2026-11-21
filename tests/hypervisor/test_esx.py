@@ -1217,7 +1217,7 @@ class TestEsxNegative:
 
         # run virt-who with the new hypervisor's FQDN
         new_host_name = (
-            "new" + str(random.randint(1, 10000)) + ".rhts.eng.pek2.redhat.com"
+            "new" + str(random.randint(1, 10000)) + ".example.invalid"
         )
 
         cmd = f'sed -i "s|{host_name}|{new_host_name}|g" {PRINT_JSON_FILE}'
