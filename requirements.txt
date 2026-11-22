@@ -20,5 +20,9 @@ lxml
 funcy
 passlib
 rpdb
-git+https://github.com/candlepin/hypervisor-builder.git@master
+# Pinned to hb PR #43's branch head (the hardened guest_ip() forms
+# the libvirt/hyperv discovery queries ride): keeps this branch's CI
+# and dry-runs deterministic. Moves back to @master (or a release)
+# when hb#43 merges.
+git+https://github.com/candlepin/hypervisor-builder.git@f5e1e89
 betelgeuse>=1.12,<2.0
