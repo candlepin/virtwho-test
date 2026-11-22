@@ -104,23 +104,33 @@ are relative to `systemtest/selftest/`; run any of them with
 
 ## test-discover-guest-ips.sh → test_discover_guest_ips.py
 
+The CCT-3162 conversion moved the libvirt/hyperv QUERY mechanics
+into hypervisor-builder (hb): the transport variants (rows 1–3's
+sshpass/key/arp paths, row 4's IPv4-over-IPv6 parsing, rows 10–11's
+stdin injection discipline) are now pinned by hb's own test suite
+(`tests/test_guest_ip.py` in hypervisor-builder, pinned in
+requirements.txt at hb#43's head). The vt-side rows below map to
+the pins that stayed or moved to the new hb seam; the ahv rows are
+unchanged (ahv keeps its shell query — hb's AHVApi cannot express
+vt's semantics without hb-side changes; C5 follow-up).
+
 | # | Old bash checkpoint (`OK:` line) | New pytest test(s) |
 |---|---|---|
-| 1 | libvirt guest_ip discovered via the sshpass fallback (loopback excluded) | `TestDiscoveryParsing::test_libvirt_sshpass_fallback_loopback_excluded` |
-| 2 | libvirt guest_ip discovered via key-based ssh | `TestDiscoveryParsing::test_libvirt_key_based_ssh` |
-| 3 | arp fallback used when the guest agent reports nothing | `TestDiscoveryParsing::test_libvirt_arp_fallback` |
-| 4 | hyperv guest_ip discovered (IPv4 preferred over IPv6) | `TestDiscoveryParsing::test_hyperv_powershell_ipv4_preferred` |
+| 1 | libvirt guest_ip discovered via the sshpass fallback (loopback excluded) | `TestDiscoveryParsing::test_libvirt_ip_from_hb_written_back` (the query itself is hb's, pinned in hb's suite; the loopback exclusion moved with it) |
+| 2 | libvirt guest_ip discovered via key-based ssh | moved to hb (its transport chooses the auth; the vt side no longer shells out to ssh at all — see the row 19 note) |
+| 3 | arp fallback used when the guest agent reports nothing | moved to hb (`TestLibvirtGuestIp::test_arp_fallback_when_agent_finds_nothing` there) |
+| 4 | hyperv guest_ip discovered (IPv4 preferred over IPv6) | `TestDiscoveryParsing::test_hyperv_ip_from_hb_written_back` (the IPv4-over-IPv6 parsing is hb's `first_ipv4`, pinned in hb's suite) |
 | 5 | ahv guest_ip discovered from the Prism response | `TestDiscoveryParsing::test_ahv_prism_json_exact_match_empty_skipped` |
-| 6 | failed discovery keeps the ini value, exits 0 and warns on stderr | `TestDiscoveryGates::test_failed_discovery_keeps_ini_and_warns` (ids: curl-fail / ssh-down) |
+| 6 | failed discovery keeps the ini value, exits 0 and warns on stderr | `TestDiscoveryGates::test_failed_discovery_keeps_ini_and_warns` (ids: curl-fail / hb-error / hb-none — an hb exception and an hb None answer both ride the same fallback) |
 | 7 | unsupported hypervisor is a no-op | `TestDiscoveryGates::test_unsupported_hypervisor_is_noop` |
 | 8 | missing ini file fails loudly | `TestDiscoveryGates::test_missing_ini_fails_loudly` |
 | 9 | update written through a symlink, mode 0600 preserved | `TestWriteBack::test_write_through_symlink_mode_preserved` |
-| 10 | a quoted guest_name is remote DATA, never remote code (no execution; stdin) | `TestInjectionChecks::test_libvirt_guest_name_is_data_not_code` |
-| 11 | the hyperv PowerShell query receives the guest name as stdin data (fixed command, exact-name post-filter) | `TestInjectionChecks::test_hyperv_guest_name_is_data_not_code` |
+| 10 | a quoted guest_name is remote DATA, never remote code (no execution; stdin) | moved to hb (`TestLibvirtGuestIp::test_guest_name_never_enters_the_command` there); the vt side of the seam is pinned by `TestHbDataTransport::test_ini_values_reach_hb_as_arguments` and `::test_odd_guest_name_rides_as_data` |
+| 11 | the hyperv PowerShell query receives the guest name as stdin data (fixed command, exact-name post-filter) | moved to hb (`TestHypervGuestIp` there); same vt-side seam pins as row 10 |
 | 12 | the ahv query percent-encodes the guest_name (no raw splicing) | `TestInjectionChecks::test_ahv_guest_name_percent_encoded` |
 | 13 | ahv credentials travel on curl's stdin config stream, never the command line | `TestInjectionChecks::test_ahv_credentials_on_stdin_config_stream` |
 | 14 | configparser-valid 'key = value' spacing is parsed (inner-space value survives) | `TestWriteBack::test_configparser_spacing_parsed` |
-| 15 | hyperv discovery never attempts ssh with an empty password | `TestDiscoveryGates::test_hyperv_empty_password_skips_ssh` |
+| 15 | hyperv discovery never attempts ssh with an empty password | `TestDiscoveryGates::test_hyperv_empty_password_skips_query` (re-anchored on the hb seam: the CLI must not be constructed at all) |
 | 16 | VIRTWHO_SKIP_IP_DISCOVERY=1 keeps the ini guest_ip and logs the skip | `TestDiscoveryGates::test_skip_knob_keeps_ini_value` |
 | 17 | overwriting a differing non-empty ini guest_ip emits a WARNING naming both values | `TestDiscoveryGates::test_overwrite_warning_names_both_values` |
 | 18 | a malformed ini makes the write-back a clean warning (ini kept, exit 0) | `TestWriteBack::test_malformed_ini_writeback_is_warning` |
@@ -139,7 +149,9 @@ remaining entries below are genuinely new.)
   (strengthening only: the bash suite checked a shared workdir after
   successes).
 - `TestDiscoveryParsing::test_qemu_ssh_uri_normalized_to_bare_host` —
-  the qemu+ssh:// URI normalization.
+  the qemu+ssh:// URI normalization (re-anchored on the hb seam by
+  the CCT-3162 conversion: the fake CLI records the server it is
+  constructed with, which must be the bare host).
 - `TestDiscoveryGates::test_same_value_discovery_no_overwrite_warning`
   — an agreeing discovery emits no spurious warning.
 - `TestDiscoveryGates::test_ahv_newline_credential_named_warning` —
@@ -186,9 +198,13 @@ remaining entries below are genuinely new.)
   definition of the options every shell-side ssh invocation in
   systemtest/ builds on, with a bounded connect on every site
   (three of the five historical sites carried no ConnectTimeout at
-  all). Behaviorally pinned through the recording ssh stub's full
-  argv (the ssh_exec key path and the `sshpass -e ssh` array
-  splice), source-pinned on lib.sh's single definition and the
+  all). Since the CCT-3162 conversion the discovery itself makes NO
+  shell ssh call anymore (the libvirt/hyperv queries ride
+  hypervisor-builder's own paramiko transport), which the
+  behavioral pin proves through a marker ssh stub that must never
+  run -- a reintroduced shell query would re-open the
+  command-injection surface the conversion removed; the remaining
+  pins are source-level, on lib.sh's single definition and the
   non-hermetic sites' wiring (run-tests.sh's ssh-copy-id and key
   probe, prepare-kubevirt.sh's guest-proxy ssh); the matching
   mutation (`ssh-baseline-connect-timeout`) removes the

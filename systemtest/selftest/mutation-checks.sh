@@ -12,7 +12,7 @@
 # matches (the code drifted) is a loud error, never a silently green
 # run; a mutation the suite survives is a MISS and fails this script.
 #
-# Not wired into the Lint workflow on purpose: 40 full suite runs
+# Not wired into the Lint workflow on purpose: 39 full suite runs
 # (~30 minutes locally, ~45 s per run). Run it manually before
 # touching systemtest/scripts/:
 #
@@ -52,24 +52,20 @@ tree = sys.argv[1]
 # --- the standing battery -------------------------------------------------
 # Every mutation here re-introduces a REAL regression this PR (or the
 # #297/#298 hardening before it) fixed; the suite must fail on each.
+# NOTE on the hb conversion (CCT-3162): the libvirt/hyperv query
+# mutations (inject-libvirt, inject-hyperv, exact-name) RETIRED with
+# the shell queries they mutated -- those behaviors moved into
+# hypervisor-builder, whose own test suite (tests/test_guest_ip.py)
+# now pins the stdin transport and the exact-name filter. The
+# vt-side behaviors that stayed (the empty-password guard, the URI
+# normalization, the hb dispatch itself) keep their entries below,
+# re-anchored on the new code.
 BATTERY = [
-    # 1-3) injection splices x3: the ini-sourced guest_name is
-    # DOWNLOADED, untrusted input; splicing it into a command string
-    # or URL is remote code execution on the hypervisor.
-    ("inject-libvirt",
-     "guest_name spliced into the libvirt remote command instead "
-     "of riding ssh stdin",
-     "systemtest/scripts/discover-guest-ips.sh",
-     "out=$(ssh_output 'read -r dom; virsh domifaddr \"$dom\" --source agent') || true",
-     "out=$(ssh_output \"read -r dom; virsh domifaddr \\\"$GUEST_NAME\\\" --source agent\") || true",
-     False),
-    ("inject-hyperv",
-     "guest_name spliced into the PowerShell command string instead "
-     "of riding ssh stdin",
-     "systemtest/scripts/discover-guest-ips.sh",
-     "'PowerShell -Command \"$n=[Console]::In.ReadToEnd().Trim(); (Get-VMNetworkAdapter -VMName $n | Where-Object Name -eq $n).IpAddresses\"'",
-     "\"PowerShell -Command \\\"(Get-VMNetworkAdapter -VMName '$GUEST_NAME' | Where-Object Name -eq '$GUEST_NAME').IpAddresses\\\"\"",
-     False),
+    # 1) injection splice: the ini-sourced guest_name is
+    # DOWNLOADED, untrusted input; splicing it into the Prism URL
+    # is remote code execution on the hypervisor. (The
+    # libvirt/hyperv twins of this class retired with the shell
+    # queries -- see the note above.)
     ("inject-ahv",
      "raw guest_name spliced into the Prism query URL (percent-"
      "encoding removed)",
@@ -77,7 +73,7 @@ BATTERY = [
      "\"https://${HYP_SERVER}:9440/api/nutanix/v2.0/vms/?name=${GUEST_NAME_ENC}&include_vm_nic_config=true\"",
      "\"https://${HYP_SERVER}:9440/api/nutanix/v2.0/vms/?name=${GUEST_NAME}&include_vm_nic_config=true\"",
      False),
-    # 4-5) confinement disables x2: the write side and the shred side
+    # confinement disables x2: the write side and the shred side
     # of the kubeconfig confinement, disabled independently (the rule
     # itself is single-sourced in lib.sh's kv_path_is_confined).
     ("confine-disable-write",
@@ -94,7 +90,7 @@ BATTERY = [
      "kv_path_is_confined \"$f\"",
      "true",
      False),
-    # 6) glob revert: suffixed/hidden credential variants survive.
+    # 2) glob revert: suffixed/hidden credential variants survive.
     ("glob-revert",
      "/etc/virt-who.d sweep glob narrowed from *.conf* to *.conf "
      "(suffixed/hidden variants survive)",
@@ -102,7 +98,7 @@ BATTERY = [
      "\"${VIRTWHO_D_DIR}\"/*.conf* \"${VIRTWHO_D_DIR}\"/.*.conf*",
      "\"${VIRTWHO_D_DIR}\"/*.conf \"${VIRTWHO_D_DIR}\"/.*.conf",
      False),
-    # 7) split-knob revert: two independently-settable knobs for one
+    # 3) split-knob revert: two independently-settable knobs for one
     # invariant could drift apart.
     ("split-knob",
      "shred side back on its own VIRTWHO_CLEANUP_KUBECONFIG_ROOT knob "
@@ -111,7 +107,7 @@ BATTERY = [
      "KV_ROOT=$(kv_root)",
      "KV_ROOT=${VIRTWHO_CLEANUP_KUBECONFIG_ROOT:-/root}",
      False),
-    # 8) /tmp shred revert: the upgrade tests' credential copies
+    # 4) /tmp shred revert: the upgrade tests' credential copies
     # survive on disk.
     ("tmp-shred-revert",
      "the upgrade tests' /tmp *.conf.pre/.post copies no longer "
@@ -123,7 +119,7 @@ BATTERY = [
      "done",
      ":",
      False),
-    # 9) ahv-argv: credentials on curl's command line (/proc visibility).
+    # 5) ahv-argv: credentials on curl's command line (/proc visibility).
     ("ahv-argv",
      "ahv credentials on curl's command line (-u) instead of the "
      "stdin config stream (-K -)",
@@ -134,7 +130,7 @@ BATTERY = [
      "    if ! body=$(curl -skf --connect-timeout 10 --max-time 60 \\\n"
      "            --retry 2 --retry-delay 5 -u \"${HYP_USER}:${HYP_PASS}\" \\",
      False),
-    # 10-11) canonicalization x2: the knob root and the checked path.
+    # canonicalization x2: the knob root and the checked path.
     # kv_root()/kv_path_is_confined() are single-sourced in lib.sh,
     # so each canonicalization is one mutation covering BOTH sides.
     ("canon-root",
@@ -151,7 +147,7 @@ BATTERY = [
      "resolved=$(realpath -m -- \"$1\" 2>/dev/null) || return 1",
      "resolved=$1",
      False),
-    # 12) nocaseglob removal: uppercase variants survive the sweep.
+    # 6) nocaseglob removal: uppercase variants survive the sweep.
     ("nocaseglob",
      "nocaseglob removed from the virt-who.d sweep (an uppercase "
      "variant of a suite-written name survives)",
@@ -159,7 +155,7 @@ BATTERY = [
      "shopt -s nocaseglob",
      ":",
      False),
-    # 13) skip-knob removal: the discovery opt-out disappears.
+    # 7) skip-knob removal: the discovery opt-out disappears.
     ("skip-knob",
      "VIRTWHO_SKIP_IP_DISCOVERY gate removed from the discovery",
      "systemtest/scripts/discover-guest-ips.sh",
@@ -169,17 +165,20 @@ BATTERY = [
      "fi",
      ":",
      False),
-    # 14) empty-pass guard removal: empty-password ssh attempt.
+    # 8) empty-pass guard removal: empty-password query attempt.
+    # (Re-anchored on the python helper by the hb conversion: the
+    # guard now keeps the CLI from being constructed at all, since
+    # hb's transport would fall back to an ssh-agent attempt
+    # instead of the ini credential.)
     ("empty-pass",
-     "hyperv empty-password guard removed (empty-password login "
-     "attempt)",
-     "systemtest/scripts/discover-guest-ips.sh",
-     "    if [ -z \"$HYP_PASS\" ]; then\n"
-     "        return 1\n"
-     "    fi\n",
+     "hyperv empty-password guard removed (hb's transport falls "
+     "back to an ssh-agent attempt instead of the ini credential)",
+     "systemtest/scripts/discover_guest_ips.py",
+     "    if family == \"hyperv\" and not password:\n"
+     "        return None\n",
      "",
      False),
-    # 15) overwrite-warning removal: a wrong-IP success is silent.
+    # 9) overwrite-warning removal: a wrong-IP success is silent.
     ("overwrite-warning",
      "the differing-guest_ip overwrite WARNING removed (a wrong-IP "
      "success is silent)",
@@ -189,15 +188,28 @@ BATTERY = [
      "    fi\n",
      "",
      False),
-    # 16) exact-name post-filter drop: wildcard names match other VMs.
-    ("exact-name",
-     "the PowerShell exact-name post-filter dropped (a name with "
-     "wildcard characters can match a different VM)",
+    # 10) hb-dispatch bypass: the bash discovery stops calling the
+    # hb query helper -- every libvirt/hyperv run silently degrades
+    # to the fallback warning (the conversion's own seam).
+    ("hb-dispatch-bypassed",
+     "the bash discovery stops calling the hb query helper (an "
+     "empty answer on every libvirt/hyperv run)",
      "systemtest/scripts/discover-guest-ips.sh",
-     "(Get-VMNetworkAdapter -VMName $n | Where-Object Name -eq $n).IpAddresses",
-     "(Get-VMNetworkAdapter -VMName $n).IpAddresses",
+     "    python3 \"${SCRIPT_DIR}/discover_guest_ips.py\" \"$INI\" \"$HYP\"",
+     "    true",
      False),
-    # 17) install-deps message: the skip becomes invisible.
+    # 11) uri-normalize disable: hb's LibvirtCLI is handed the full
+    # qemu+ssh://user@host/system URI as the connection target.
+    ("uri-normalize",
+     "the qemu+ssh:// URI normalization disabled (hb's LibvirtCLI "
+     "is handed the full URI as the connection target)",
+     "systemtest/scripts/discover_guest_ips.py",
+     "    if \"://\" in server:\n"
+     "        server = server.split(\"://\", 1)[1]\n",
+     "    if False:\n"
+     "        server = server.split(\"://\", 1)[1]\n",
+     False),
+    # 12) install-deps message: the skip becomes invisible.
     ("install-deps-message",
      "the VIRTWHO_SQUID_IMAGE skip message replaced with a vague one "
      "(the env-contract regression the message pins)",
@@ -205,7 +217,7 @@ BATTERY = [
      "echo \"VIRTWHO_SQUID_IMAGE not set; skipping the bad-proxy container image pre-pull\"",
      "echo \"no image configured\"",
      False),
-    # 18) failure-cache disable: failing Vault paths re-fetched.
+    # 13) failure-cache disable: failing Vault paths re-fetched.
     ("failure-cache",
      "per-path Vault failure cache disabled (every resolution of a "
      "failing path re-fetches)",
@@ -213,7 +225,7 @@ BATTERY = [
      "if path not in self._path_cache:",
      "if True:",
      False),
-    # 19) destination default flip: every run without an explicit
+    # 14) destination default flip: every run without an explicit
     # knob would silently build the stage-tier ini (the Jenkins runs
     # this PR exists to fix).
     ("destination-default-flip",
@@ -223,7 +235,7 @@ BATTERY = [
      "DESTINATION=${VIRTWHO_DESTINATION:-container}",
      "DESTINATION=${VIRTWHO_DESTINATION:-stage}",
      False),
-    # 20) prefix regression: the configured prefix ignored, every
+    # 15) prefix regression: the configured prefix ignored, every
     # destination spoken to as /subscription (send-counts read zero
     # against the container tier).
     ("prefix-regression",
@@ -233,7 +245,7 @@ BATTERY = [
      "        return \"/\" + stripped\n",
      "        return \"/subscription\"\n",
      False),
-    # 21) overlay-skip removal: a stale VIRTWHO_RHSM_* stage secret
+    # 16) overlay-skip removal: a stale VIRTWHO_RHSM_* stage secret
     # from an old pipeline would override the hermetic destination.
     ("overlay-skip-removal",
      "the container-mode [rhsm] env-overlay skip removed (stale stage "
@@ -243,7 +255,7 @@ BATTERY = [
      "        continue\n",
      "",
      False),
-    # 22) readiness-503 regression: readiness accepts any HTTP
+    # 17) readiness-503 regression: readiness accepts any HTTP
     # answer again.
     ("readiness-503-passes",
      "readiness accepts any HTTP status again (a 503 during app "
@@ -252,7 +264,7 @@ BATTERY = [
      "    if [ \"$http_code\" = \"200\" ]; then",
      "    if [ \"$http_code\" != \"000\" ]; then",
      False),
-    # 23) marker-absent-green regression: the
+    # 18) marker-absent-green regression: the
     # vacuous-green guard stops failing the run.
     ("marker-absent-green",
      "the vacuous-green guard exits 0 on a missing marker (a broken "
@@ -261,7 +273,7 @@ BATTERY = [
      "    exit 1",
      "    exit 0",
      False),
-    # 24) plan-ordering revert: the candlepin deploy back BEFORE
+    # 19) plan-ordering revert: the candlepin deploy back BEFORE
     # the clone. A successful deploy
     # creates INSTALL_DIR + the marker, and the subsequent git clone
     # into the non-empty dir exits 128 -- tmt prepare fails on every
@@ -287,7 +299,7 @@ BATTERY = [
      "      how: shell\n"
      "      script: ./systemtest/scripts/setup-virtwho-test.sh",
      False),
-    # 25) baseurl removal: the container overlay loses
+    # 20) baseurl removal: the container overlay loses
     # its repo-container baseurl -- the tier would silently inherit
     # a stage CDN leftover from the base ini (content ops 403 against
     # stage) and stop being hermetic on content.
@@ -299,7 +311,7 @@ BATTERY = [
      "baseurl=http://localhost:8080\n",
      "baseurl=\n",
      False),
-    # 26) noproxy removal: the readiness
+    # 21) noproxy removal: the readiness
     # probe's proxy bypass removed -- the pipeline env's HTTPS_PROXY
     # routes the pod-facing probe through a proxy that can never
     # reach the guest's own ports (connection-level 000 while the
@@ -317,7 +329,7 @@ BATTERY = [
      "        --connect-timeout 5 --max-time 10 \\\n"
      "        https://localhost:8443/candlepin/status",
      False),
-    # 27) SCA strictness revert: the strict ACTIVE-mode
+    # 22) SCA strictness revert: the strict ACTIVE-mode
     # re-verification weakened to a parse-only check -- an
     # entitlement-active org passes again (RHEL-10's
     # subscription-manager gates username/password registration
@@ -337,7 +349,7 @@ BATTERY = [
      "                     f\"{active!r}, not 'org_environment' (username/\"\n"
      "                     \"password registration requires the ACTIVE mode)\")\n",
      False),
-    # 28) undertest precedence flip : the version-under-test cache
+    # 23) undertest precedence flip : the version-under-test cache
     # ignores TEST_RPMS -- the compose download runs even in gating
     # mode, caching the compose's virt-who while a gated build is
     # under test.
@@ -350,7 +362,7 @@ BATTERY = [
      "UNDERTTEST_CACHE=\"${INSTALL_DIR}/virt-who-under-test.rpm\"\n"
      "if false; then",
      False),
-    # 29) sidecar-override revert : the computed virt-who NEVRA is
+    # 24) sidecar-override revert : the computed virt-who NEVRA is
     # silently discarded again whenever the statically published
     # base ini carries a (stale) value -- every version expectation
     # in the suite goes stale.
@@ -362,7 +374,7 @@ BATTERY = [
      "override(\"virtwho\", \"package\")",
      "fallback(\"virtwho\", \"package\", None)",
      False),
-    # 30) by-rpm repo-download revert : the by-rpm test downloads
+    # 25) by-rpm repo-download revert : the by-rpm test downloads
     # its rpm from the enabled repos again -- the registered
     # container-tier host's only enabled repo is the pod's dead
     # content repo.
@@ -374,7 +386,7 @@ BATTERY = [
      "rpm_path = virtwho_download_under_test(ssh_host, file_path)",
      "rpm_path = dnf_download_pkg(ssh_host, \"virt-who\", file_path)",
      False),
-    # 31) dep-safe uninstall revert : dnf5 cleans virt-who's
+    # 26) dep-safe uninstall revert : dnf5 cleans virt-who's
     # automatically-installed dependencies with the package again,
     # starving the repo-less reinstall of the version under test.
     ("depsafe-uninstall-revert",
@@ -385,7 +397,7 @@ BATTERY = [
      "package_uninstall(ssh_host, \"virt-who\", keep_deps=True)",
      "package_uninstall(ssh_host, \"virt-who\")",
      False),
-    # 32) reinstall-guard revert (the cascade guard): the by-dnf
+    # 27) reinstall-guard revert (the cascade guard): the by-dnf
     # teardown reinstalls conditionally again -- a failed body
     # leaves the suite without virt-who for every later test.
     ("reinstall-guard-revert",
@@ -399,7 +411,7 @@ BATTERY = [
      "            if TEST_RPMS or package_check(ssh_host, \"virt-who\") is False:\n"
      "                virtwho_install_under_test(ssh_host)",
      False),
-    # 33) arch stderr revert: the cached-rpm arch query captures
+    # 28) arch stderr revert: the cached-rpm arch query captures
     # stderr again -- the compose-signed rpm's GPG NOKEY warning
     # becomes the parsed arch value.
     ("arch-stderr-revert",
@@ -409,7 +421,7 @@ BATTERY = [
      "f\"rpm -qp --qf '%{{arch}}' {VIRTWHO_UNDERTEST_RPM} 2>/dev/null\"",
      "f\"rpm -qp --qf '%{{arch}}' {VIRTWHO_UNDERTEST_RPM}\"",
      False),
-    # 34) download TEST_RPMS rung removal: the by-rpm test's
+    # 29) download TEST_RPMS rung removal: the by-rpm test's
     # downloader loses its TEST_RPMS branch again -- a gating run
     # with a failed prepare-phase cache falls through to the
     # enabled repos (the dead pod repo on the container tier).
@@ -423,7 +435,7 @@ BATTERY = [
       "    if False:\n"
       "        # the virt-who rpm of the URL list (the same selection the\n",
       False),
-    # 35) override-clear revert: the version-under-test trio's merge
+    # 30) override-clear revert: the version-under-test trio's merge
     # goes back to the non-empty-only rule -- an empty computed
     # test_rpms cannot CLEAR a stale published base-ini value.
     ("override-clear-revert",
@@ -434,7 +446,7 @@ BATTERY = [
       "    if computed.has_option(section, option):\n",
       "    if computed.has_option(section, option) and computed.get(section, option):\n",
       False),
-    # 36) placeholder-guard removal: the sidecar records a bare
+    # 31) placeholder-guard removal: the sidecar records a bare
     # virt-who placeholder again when no real NEVRA resolves --
     # it clobbers a correct base-ini value through the override.
     ("placeholder-guard-removal",
@@ -446,7 +458,7 @@ BATTERY = [
       "    cfg.set(\"virtwho\", \"package\", nevra)",
       "cfg.set(\"virtwho\", \"package\", nevra or \"virt-who\")",
       False),
-    # 37) uninstall-guard revert: the failure guard goes back to the
+    # 32) uninstall-guard revert: the failure guard goes back to the
     # dead `is True` form -- a failed uninstall passes silently.
     ("uninstall-guard-revert",
      "package_uninstall's failure guard reverts to the dead `is True` "
@@ -455,7 +467,7 @@ BATTERY = [
       "    if package_check(ssh, pkg_name) is not False:\n",
       "    if package_check(ssh, pkg_name) is True:\n",
       False),
-    # 38) contract-curl insecure-flag revert: the post-CA
+    # 33) contract-curl insecure-flag revert: the post-CA
     # data-contract status probe carries -k again (a
     # credential-bearing curl with TLS verification disabled after
     # trust was proven).
@@ -467,7 +479,7 @@ BATTERY = [
       "status_code=$(curl -s -o \"$CONTRACT_STATUS_TMP\" -w '%{http_code}' \\\n",
       "status_code=$(curl -sk -o \"$CONTRACT_STATUS_TMP\" -w '%{http_code}' \\\n",
       False),
-    # 39) proxy-alias promotion removal: configure-proxy.sh stops
+    # 34) proxy-alias promotion removal: configure-proxy.sh stops
     # promoting the [job] aliases -- a satellite cell configured via
     # VIRTWHO_JOB_REGISTER gets a stray rhsm.conf proxy.
     ("proxy-alias-promotion-removal",
@@ -478,7 +490,7 @@ BATTERY = [
       "promote_job_aliases",
       ":",
       False),
-    # 40) ssh-baseline unbounding: the shared ConnectTimeout drops
+    # 35) ssh-baseline unbounding: the shared ConnectTimeout drops
     # out of lib.sh's ssh transport baseline -- every shell-side ssh
     # site re-opens the unbounded-connect class (three of the five
     # sites carried no ConnectTimeout before the baseline existed).

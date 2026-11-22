@@ -1,22 +1,30 @@
-"""Pytest self-test for discover-guest-ips.sh (the pytest conversion
-of the former test-discover-guest-ips.sh checkpoint script).
+"""Pytest self-test for discover-guest-ips.sh and its
+hypervisor-builder (hb) query helper discover_guest_ips.py.
 
 All values used here are dummy (non-secret, non-real): example.com
-names and TEST-NET-1 addresses. The hypervisor side is faked with
-PATH-injected ssh/sshpass/curl stubs that replay canned output (fake
-DHCP data), so no network access and no real credentials are
-involved. The stubs keep their exact recording semantics from the
-bash suite: the recording ssh stub hands the received command to a
-REAL shell with the received stdin attached (a payload spliced into
-the command string would actually execute and be caught), and the
-recording curl stub captures both its arguments and its stdin config
-stream.
+names and TEST-NET-1 addresses. The hypervisor side is faked at two
+layers, hermetically (no network access, no real credentials):
+
+  * libvirt/hyperv: a FAKE hypervisor-builder package, first on the
+    helper's PYTHONPATH -- its LibvirtCLI/HypervCLI classes record
+    their constructor arguments and guest_ip() calls (JSON lines in
+    a file) and replay canned addresses. The vt side is pinned
+    through this seam: the ini values reach hb as python data, the
+    qemu+ssh:// URI is normalized before the constructor, an empty
+    hyperv password never constructs the CLI at all, and a failed
+    discovery keeps the ini value. The hardened QUERY forms
+    themselves (the guest name on the ssh session's stdin, the
+    PowerShell exact-name post-filter, the agent-then-arp fallback)
+    moved INTO hb with this conversion -- their protection lives in
+    hb's own test suite (tests/test_guest_ip.py in
+    hypervisor-builder), not here;
+  * ahv: unchanged from the bash suite -- PATH-injected curl stubs
+    replay a canned Prism response and record the query.
 
 Covers, behavior-first:
-  * per-family discovery parsing (libvirt domifaddr with the sshpass
-    fallback and the key-based path and the ARP fallback, hyperv
-    PowerShell output with IPv4 over IPv6, ahv Prism JSON with exact
-    name match and empty NIC addresses skipped);
+  * per-family discovery (libvirt/hyperv through the fake hb CLI,
+    ahv Prism JSON with exact name match and empty NIC addresses
+    skipped);
   * the write-back matrix: guest_ip lands in the ini, other values
     preserved, write through a symlink, mode kept, configparser-valid
     `key = value` spacing, malformed ini (duplicate option) degrading
@@ -26,21 +34,24 @@ Covers, behavior-first:
     no-op, a missing ini fails loudly, VIRTWHO_SKIP_IP_DISCOVERY=1
     skips with a message, a differing non-empty ini value is
     overwritten with a WARNING naming both values, and hyperv never
-    attempts ssh with an empty password;
-  * the injection checks: the ini-sourced guest_name is remote DATA,
-    never remote code (libvirt/hyperv stdin transport with a fixed
-    command string, the exact-name post-filter, ahv percent-encoding)
-    and the ahv credentials ride to curl on its stdin config stream,
-    never its command line;
-  * the shared ssh transport baseline (lib.sh's SSH_BASE_OPTS /
-    ssh_exec): every ssh the discovery makes carries the bounded,
-    non-interactive, quiet options -- one definition, not five;
+    attempts the hb query with an empty password;
+  * the data-transport checks: the ini-sourced values ride into hb
+    as python constructor/method arguments (never a command string
+    or an URL -- the vt-side injection surface is gone by
+    construction, pinned here), and the ahv guest_name is
+    percent-encoded with the credentials on curl's stdin config
+    stream;
+  * the shell-ssh retirement: the libvirt/hyperv discovery makes NO
+    shell ssh call anymore (the queries ride hb's own transport) --
+    a reintroduced shell query would re-open the command-injection
+    surface this conversion removed;
   * run-tests.sh guards its discovery invocation (source-pinned,
     like the password-flow checks).
 
 Run: python -m pytest systemtest/selftest/ -v
 """
 
+import json
 import os
 import re
 import subprocess
@@ -56,83 +67,21 @@ from _utils import (
 
 DISCOVER = SCRIPTS_DIR / "discover-guest-ips.sh"
 
-# --- Fake hypervisor access: ssh/sshpass/curl stubs on PATH --------------
-# (verbatim ports of the bash suite's stubs; the FAKE_* environment
-# knobs drive their behavior)
+# --- Fake hypervisor access ------------------------------------------------
+# (the ahv curl stub is a verbatim port of the bash suite's; the
+# libvirt/hyperv ssh stubs are gone with the shell queries -- the
+# fake hb package below replaces them, and the ssh stub that remains
+# exists only to PROVE no shell ssh happens anymore)
 
 SSH_STUB = """\
 #!/bin/bash
-# Fake ssh for the self-test: replay canned hypervisor output based on
-# the remote command (the last argument).
-cmd="${*: -1}"
-
-# FAKE_SSH_MARKER: when set, touch the file on EVERY invocation, so a
-# checkpoint can prove ssh was NOT called at all.
+# Marker-only fake ssh: the libvirt/hyperv discovery queries ride
+# hypervisor-builder's own transport now, so this stub must never
+# run. When FAKE_SSH_MARKER is set, every invocation touches the
+# file, so a checkpoint can prove ssh was NOT called at all.
 [ -n "${FAKE_SSH_MARKER:-}" ] && touch "${FAKE_SSH_MARKER}"
-
-# FAKE_SSH_DEST_FILE: when set, record the destination argument
-# (second-to-last: user@host) for the URI-normalization checkpoint.
-[ -n "${FAKE_SSH_DEST_FILE:-}" ] && printf '%s\n' "${@: -2:1}" > "${FAKE_SSH_DEST_FILE}"
-
-# FAKE_SSH_MODE=down: simulate an unreachable hypervisor.
-if [ "${FAKE_SSH_MODE:-}" = "down" ]; then
-    exit 255
-fi
-
-# FAKE_SSH_MODE=record: behave like a real sshd for the injection
-# checkpoint -- record the received command string and stdin, then
-# hand the command to a REAL shell with the stdin attached. A payload
-# spliced into the command string would actually execute here (and
-# be caught); a name riding on stdin as data cannot. The full argv
-# is recorded too (the shared ssh-baseline checkpoint: the options
-# ssh was invoked with).
-if [ "${FAKE_SSH_MODE:-}" = "record" ]; then
-    cat > "${FAKE_SSH_RECORD_DIR}/stdin"
-    printf '%s\\n' "$*" > "${FAKE_SSH_RECORD_DIR}/argv"
-    printf '%s\\n' "$cmd" > "${FAKE_SSH_RECORD_DIR}/cmd"
-    bash -c "$cmd" < "${FAKE_SSH_RECORD_DIR}/stdin" \\
-        > /dev/null 2>&1 || true
-    printf ' vnet1      52:54:00:aa:bb:dd    ipv4         192.0.2.50/24\\n'
-    exit 0
-fi
-
-# Simulate "no key trust" for BatchMode unless explicitly allowed, so
-# the password (sshpass) fallback path is exercised by default.
-if [[ "$*" == *BatchMode=yes* && "${FAKE_SSH_ALLOW_BATCH:-}" != "1" ]]; then
-    exit 255
-fi
-
-if [[ "$cmd" == *"virsh domifaddr"* ]]; then
-    if [[ "$cmd" == *"--source agent"* ]]; then
-        # FAKE_SSH_MODE=agent-empty: guest agent present but no address.
-        if [ "${FAKE_SSH_MODE:-}" = "agent-empty" ]; then
-            exit 0
-        fi
-        printf ' Name       MAC address    Protocol     Address\\n'
-        printf -- '----------------------------------------------------------\\n'
-        printf ' vnet0      52:54:00:aa:bb:cc    ipv4         127.0.0.1/8\\n'
-        printf ' vnet1      52:54:00:aa:bb:dd    ipv4         192.0.2.50/24\\n'
-    elif [[ "$cmd" == *"--source arp"* ]]; then
-        printf ' vnet1      52:54:00:aa:bb:dd    ipv4         192.0.2.51/24\\n'
-    else
-        echo "fake ssh: unexpected domifaddr source in: $cmd" >&2
-        exit 1
-    fi
-elif [[ "$cmd" == *"Get-VMNetworkAdapter"* ]]; then
-    # IPv4 first, IPv6 second (what PowerShell prints for a guest NIC).
-    printf '{192.0.2.60 fe80::abcd}\\n'
-else
-    echo "fake ssh: unexpected command: $cmd" >&2
-    exit 1
-fi
-"""
-
-SSHPASS_STUB = """\
-#!/bin/bash
-# Fake sshpass: drop the -e flag and run the wrapped command (the
-# password arrives via SSHPASS, which this stub ignores).
-shift
-exec "$@"
+echo "fake ssh: the guest-IP discovery must not shell out to ssh" >&2
+exit 255
 """
 
 CURL_STUB = """\
@@ -159,6 +108,51 @@ printf '{"metadata": {"name": "other-guest"}, "status": {"vm_nics": [{"ip_addres
 printf '{"metadata": {"name": "selftest-ahv-guest"}, "status": {"vm_nics": [{"ip_address": ""}, {"ip_address": "192.0.2.70"}]}}'
 printf ']}\\n'
 """
+
+# The fake hypervisor-builder CLI module, generated per family: the
+# class name must match the real import path
+# (hypervisor.virt.<family>.<family>cli) because the helper imports
+# exactly that, and PYTHONPATH shadowing is what swaps the real
+# pip-installed hb for this fake -- the CLI layer is faked, never
+# the network (no paramiko, no ssh, no requests).
+FAKE_CLI_TEMPLATE = '''\
+"""Fake hypervisor-builder CLI class (generated by the self-test).
+
+Records the constructor arguments and the guest_ip call as JSON
+lines into FAKE_HB_RECORD_FILE, and answers from FAKE_HB_IP /
+FAKE_HB_MODE: "" (the default) replays the canned address, "none"
+makes guest_ip return None (a failed discovery), "fail" makes it
+raise (an hb-level error). Dummy values only.
+"""
+import json
+import os
+
+
+def _record(event):
+    path = os.environ.get("FAKE_HB_RECORD_FILE")
+    if path:
+        with open(path, "a") as handle:
+            handle.write(json.dumps(event) + "\\n")
+
+
+class {cls}:
+    default_ip = "{ip}"
+
+    def __init__(self, server, ssh_user, ssh_passwd):
+        _record(dict(event="init", cls="{cls}", server=server,
+                     ssh_user=ssh_user, ssh_passwd=ssh_passwd))
+        self.server = server
+
+    def guest_ip(self, guest_name):
+        _record(dict(event="guest_ip", cls="{cls}",
+                     guest_name=guest_name))
+        mode = os.environ.get("FAKE_HB_MODE", "")
+        if mode == "fail":
+            raise RuntimeError("fake hb: discovery failed")
+        if mode == "none":
+            return None
+        return os.environ.get("FAKE_HB_IP") or self.default_ip
+'''
 
 # --- A dummy ini with all three supported sections -----------------------
 
@@ -208,18 +202,54 @@ def make_ini(path):
 def stub_bin(sandbox):
     bin_dir = sandbox / "bin"
     bin_dir.mkdir()
-    for name, text in (("ssh", SSH_STUB), ("sshpass", SSHPASS_STUB),
-                       ("curl", CURL_STUB)):
+    for name, text in (("ssh", SSH_STUB), ("curl", CURL_STUB)):
         write_executable(bin_dir / name, text)
     return bin_dir
 
 
 @pytest.fixture
-def discover(sandbox, stub_bin):
-    """Run the REAL discover-guest-ips.sh with the stubs first on PATH."""
+def fake_hb(sandbox):
+    """A fake hypervisor-builder package shadowing the real one on
+    PYTHONPATH: the helper imports hypervisor.virt.libvirt.
+    libvirtcli.LibvirtCLI / hypervisor.virt.hyperv.hypervcli.
+    HypervCLI, and this package answers those imports with the
+    recording fakes. The canned addresses match the old ssh stubs
+    (libvirt 192.0.2.50, hyperv 192.0.2.60) so the gate and
+    write-back expectations carry over unchanged."""
+    root = sandbox / "fakehb"
+    pkg = root / "hypervisor" / "virt"
+    for family, cls, ip in (
+        ("libvirt", "LibvirtCLI", "192.0.2.50"),
+        ("hyperv", "HypervCLI", "192.0.2.60"),
+    ):
+        family_dir = pkg / family
+        family_dir.mkdir(parents=True)
+        module = family_dir / f"{family}cli.py"
+        module.write_text(
+            FAKE_CLI_TEMPLATE.format(cls=cls, ip=ip))
+    # the package markers the import chain walks through
+    for init_dir in (root / "hypervisor", pkg,
+                     pkg / "libvirt", pkg / "hyperv"):
+        (init_dir / "__init__.py").write_text("")
+    return root
+
+
+def hb_events(record_path):
+    """The JSON-line events the fake hb CLI recorded."""
+    return [json.loads(line)
+            for line in record_path.read_text().splitlines()]
+
+
+@pytest.fixture
+def discover(sandbox, stub_bin, fake_hb):
+    """Run the REAL discover-guest-ips.sh with the curl/ssh stubs
+    first on PATH and the fake hypervisor-builder first on
+    PYTHONPATH."""
     def _discover(ini, family, *, env=None, unset=()):
         full = run_env(env, unset)
         full["PATH"] = f"{stub_bin}{os.pathsep}{full.get('PATH', '')}"
+        full["PYTHONPATH"] = (
+            f"{fake_hb}{os.pathsep}{full.get('PYTHONPATH', '')}")
         # bounded timeout: a hung script fails the run instead of
         # hanging the suite
         return subprocess.run(
@@ -232,9 +262,9 @@ def discover(sandbox, stub_bin):
 # --- Per-family discovery parsing ----------------------------------------
 
 class TestDiscoveryParsing:
-    def test_libvirt_sshpass_fallback_loopback_excluded(self, sandbox,
-                                                        discover):
-        # the guest loopback reported by the agent source is excluded
+    def test_libvirt_ip_from_hb_written_back(self, sandbox, discover):
+        # the fake hb CLI answers 192.0.2.50; the write-back and the
+        # preservation of the other options are the vt-side contract
         ini = make_ini(sandbox / "libvirt.ini")
         proc = discover(ini, "libvirt")
         assert proc.returncode == 0, proc.stderr
@@ -245,46 +275,36 @@ class TestDiscoveryParsing:
         assert_ini_value(ini, "libvirt", "password", "dummy-libvirt-pass")
         assert_ini_value(ini, "virtwho", "server", "192.0.2.1")
 
-    def test_libvirt_key_based_ssh(self, sandbox, discover):
-        ini = make_ini(sandbox / "libvirt-key.ini")
-        proc = discover(ini, "libvirt",
-                        env={"FAKE_SSH_ALLOW_BATCH": "1"})
-        assert proc.returncode == 0, proc.stderr
-        assert_ini_value(ini, "libvirt", "guest_ip", "192.0.2.50")
-
-    def test_qemu_ssh_uri_normalized_to_bare_host(self, sandbox, discover):
-        # a qemu+ssh://user@host/system URI in [libvirt] server must
-        # be normalized before the ssh call: the stub receives the
-        # BARE host as the destination, never the scheme/userinfo/path
-        ini = make_ini(sandbox / "libvirt-uri.ini")
-        text_ = ini.read_text().replace(
-            "server=dummy-libvirt.example.com",
-            "server=qemu+ssh://dummy-libvirt.example.com/system")
-        ini.write_text(text_)
-        dest = sandbox / "ssh-dest"
-        proc = discover(ini, "libvirt",
-                        env={"FAKE_SSH_DEST_FILE": str(dest)})
-        assert proc.returncode == 0, proc.stderr
-        assert dest.read_text().splitlines() == \
-            ["dummy-libvirt-user@dummy-libvirt.example.com"], \
-            "ssh did not receive the bare host as user@host " \
-            "(URI normalization broken)"
-        assert_ini_value(ini, "libvirt", "guest_ip", "192.0.2.50")
-
-    def test_libvirt_arp_fallback(self, sandbox, discover):
-        # the guest agent reports nothing: the ARP source is used
-        ini = make_ini(sandbox / "libvirt-arp.ini")
-        proc = discover(ini, "libvirt", env={"FAKE_SSH_MODE": "agent-empty"})
-        assert proc.returncode == 0, proc.stderr
-        assert_ini_value(ini, "libvirt", "guest_ip", "192.0.2.51")
-
-    def test_hyperv_powershell_ipv4_preferred(self, sandbox, discover):
+    def test_hyperv_ip_from_hb_written_back(self, sandbox, discover):
         ini = make_ini(sandbox / "hyperv.ini")
         proc = discover(ini, "hyperv")
         assert proc.returncode == 0, proc.stderr
         assert_ini_value(ini, "hyperv", "guest_ip", "192.0.2.60")
         assert_ini_value(ini, "hyperv", "guest_name",
                          "selftest-hyperv-guest")
+
+    def test_qemu_ssh_uri_normalized_to_bare_host(self, sandbox,
+                                                  discover):
+        # a qemu+ssh://user@host/system URI in [libvirt] server must
+        # be normalized before it reaches hb: the fake CLI records
+        # the server it was CONSTRUCTED with, and that must be the
+        # BARE host, never the scheme/userinfo/path
+        ini = make_ini(sandbox / "libvirt-uri.ini")
+        text_ = ini.read_text().replace(
+            "server=dummy-libvirt.example.com",
+            "server=qemu+ssh://dummy-libvirt.example.com/system")
+        ini.write_text(text_)
+        record = sandbox / "hb-record.jsonl"
+        proc = discover(ini, "libvirt",
+                        env={"FAKE_HB_RECORD_FILE": str(record)})
+        assert proc.returncode == 0, proc.stderr
+        init = hb_events(record)[0]
+        assert init["event"] == "init", \
+            "the fake hb CLI was never constructed"
+        assert init["server"] == "dummy-libvirt.example.com", \
+            "hb did not receive the bare host as the server " \
+            "(URI normalization broken)"
+        assert_ini_value(ini, "libvirt", "guest_ip", "192.0.2.50")
 
     def test_ahv_prism_json_exact_match_empty_skipped(self, sandbox,
                                                       discover):
@@ -302,11 +322,14 @@ class TestDiscoveryParsing:
 class TestDiscoveryGates:
     @pytest.mark.parametrize("family,stub_env", [
         pytest.param("ahv", {"FAKE_CURL_MODE": "fail"}, id="curl-fail"),
-        pytest.param("libvirt", {"FAKE_SSH_MODE": "down"}, id="ssh-down"),
+        pytest.param("libvirt", {"FAKE_HB_MODE": "fail"}, id="hb-error"),
+        pytest.param("libvirt", {"FAKE_HB_MODE": "none"}, id="hb-none"),
     ])
     def test_failed_discovery_keeps_ini_and_warns(self, sandbox, discover,
                                                   family, stub_env):
         # the run must not die because a lab guest is unreachable
+        # (an hb-level error or a None answer included), and the
+        # failure output must not leak the credential values
         ini = make_ini(sandbox / f"fail-{family}.ini")
         proc = discover(ini, family, env=stub_env)
         assert proc.returncode == 0, proc.stderr
@@ -314,6 +337,8 @@ class TestDiscoveryGates:
         assert f"WARNING: could not discover the {family} guest_ip; " \
             "keeping the ini value" in proc.stderr, \
             f"the {family} discovery failure produced no warning on stderr"
+        assert f"dummy-{family}-pass" not in proc.stdout + proc.stderr, \
+            f"the {family} discovery failure leaked the password value"
 
     def test_unsupported_hypervisor_is_noop(self, sandbox, discover):
         ini = make_ini(sandbox / "noop.ini")
@@ -327,20 +352,24 @@ class TestDiscoveryGates:
         assert proc.returncode != 0, \
             "discovery survived a missing ini file"
 
-    def test_hyperv_empty_password_skips_ssh(self, sandbox, discover):
-        # no empty-password login attempt: the ini value is kept with
-        # the warning
+    def test_hyperv_empty_password_skips_query(self, sandbox, discover):
+        # no empty-password query attempt: hb's transport would fall
+        # back to an ssh-agent attempt instead of the ini credential,
+        # which this suite's hardening rules out -- the CLI must not
+        # be constructed at all; the ini value is kept with the
+        # warning
         ini = make_ini(sandbox / "hyperv-nopass.ini")
         text = ini.read_text().replace("password=dummy-hyperv-pass",
                                        "password=")
         ini.write_text(text)
-        marker = sandbox / "hyperv-nopass.marker"
+        record = sandbox / "hb-record.jsonl"
         proc = discover(ini, "hyperv",
-                        env={"FAKE_SSH_MARKER": str(marker)})
+                        env={"FAKE_HB_RECORD_FILE": str(record)})
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert_ini_value(ini, "hyperv", "guest_ip", "192.0.2.99")
-        assert not marker.exists(), \
-            "hyperv discovery attempted ssh although the password is empty"
+        assert not record.exists(), \
+            "hyperv discovery constructed the hb CLI although the " \
+            "password is empty"
         assert "WARNING: could not discover the hyperv guest_ip; " \
             "keeping the ini value" in proc.stderr, \
             "the empty-password hyperv run produced no fallback warning"
@@ -447,9 +476,11 @@ class TestWriteBack:
                          "selftest libvirt guest")
 
     def test_malformed_ini_writeback_is_warning(self, sandbox, discover):
-        # a duplicate option makes configparser refuse the whole
-        # file: the write-back must be a clean warning, the ini value
-        # kept, exit 0 -- no traceback abort
+        # a duplicate option makes the strict write-back parser
+        # refuse the whole file (the lenient reads still succeed, so
+        # the discovery itself works): the write-back must be a
+        # clean warning, the ini value kept, exit 0 -- no traceback
+        # abort
         ini = make_ini(sandbox / "duplicate-option.ini")
         with ini.open("a") as f:
             f.write("guest_ip=192.0.2.98\n")
@@ -465,72 +496,76 @@ class TestWriteBack:
         assert "Traceback" not in proc.stderr
 
 
-# --- The injection checks -------------------------------------------------
+# --- The data-transport checks ---------------------------------------------
+
+
+class TestHbDataTransport:
+    """The ini values reach hypervisor-builder as python data:
+    server/username/password into the CLI constructor, the guest
+    name into guest_ip(). Nothing from the ini is interpolated into
+    a command string or an URL by the vt side -- the injection
+    surface of the former shell queries moved INTO hb, whose own
+    test suite pins the stdin transport and the exact-name filter
+    (tests/test_guest_ip.py in hypervisor-builder); these pins
+    guard the vt side of the seam."""
+
+    def test_ini_values_reach_hb_as_arguments(self, sandbox, discover):
+        ini = make_ini(sandbox / "data-transport.ini")
+        record = sandbox / "hb-record.jsonl"
+        proc = discover(ini, "libvirt",
+                        env={"FAKE_HB_RECORD_FILE": str(record)})
+        assert proc.returncode == 0, proc.stderr
+        events = hb_events(record)
+        init = next(e for e in events if e["event"] == "init")
+        assert init["server"] == "dummy-libvirt.example.com"
+        assert init["ssh_user"] == "dummy-libvirt-user"
+        assert init["ssh_passwd"] == "dummy-libvirt-pass"
+        call = next(e for e in events if e["event"] == "guest_ip")
+        assert call["guest_name"] == "selftest-libvirt-guest"
+        assert_ini_value(ini, "libvirt", "guest_ip", "192.0.2.50")
+
+    def test_odd_guest_name_rides_as_data(self, sandbox, discover):
+        # a guest_name containing a single quote and a touch
+        # command: in the former shell queries a splice into a
+        # command string would execute it; through the hb seam the
+        # name is a python argument end-to-end, so nothing can
+        # execute it and the name must arrive verbatim
+        probe = sandbox / "injprobe"
+        probe.mkdir()
+        name = f"selftest-guest'; touch {probe}/INJECTED; echo '"
+        ini = make_ini(sandbox / "odd-name.ini")
+        ini.write_text(ini.read_text().replace(
+            "guest_name=selftest-hyperv-guest", f"guest_name={name}"))
+        record = sandbox / "hb-record.jsonl"
+        proc = discover(ini, "hyperv",
+                        env={"FAKE_HB_RECORD_FILE": str(record)})
+        assert proc.returncode == 0, proc.stderr
+        assert not (probe / "INJECTED").exists(), \
+            "a quoted guest_name executed commands somewhere on the " \
+            "way to hb (injection)"
+        call = next(e for e in hb_events(record)
+                    if e["event"] == "guest_ip")
+        assert call["guest_name"] == name, \
+            "the guest_name did not reach guest_ip() verbatim as data"
+        # the discovery still works end-to-end for the odd-but-valid
+        # name: the IP is written back and the name survives as data
+        assert_ini_value(ini, "hyperv", "guest_ip", "192.0.2.60")
+        assert_ini_value(ini, "hyperv", "guest_name", name)
 
 
 class TestInjectionChecks:
+    """The ahv injection checks (the ahv query stays in the shell);
+    the libvirt/hyperv twins retired with the shell queries -- see
+    TestHbDataTransport and hb's own test suite."""
+
     @pytest.fixture
     def payload(self, sandbox):
         """A guest_name containing a single quote and a touch command:
-        spliced into a command string it would execute and leave the
-        marker; riding on stdin as data it cannot."""
+        spliced into a URL it would alter the query; percent-encoded
+        it cannot."""
         probe = sandbox / "injprobe"
         probe.mkdir()
         return probe, f"selftest-guest'; touch {probe}/INJECTED; echo '"
-
-    def test_libvirt_guest_name_is_data_not_code(self, sandbox, discover,
-                                                 payload):
-        # the recording ssh stub behaves like a real sshd: it hands
-        # the received command string to a REAL shell with the
-        # received stdin attached, so a name spliced into the command
-        # string would execute here
-        probe, name = payload
-        ini = make_ini(sandbox / "injection.ini")
-        ini.write_text(ini.read_text().replace(
-            "guest_name=selftest-libvirt-guest", f"guest_name={name}"))
-        proc = discover(ini, "libvirt",
-                        env={"FAKE_SSH_MODE": "record",
-                             "FAKE_SSH_RECORD_DIR": str(probe)})
-        assert proc.returncode == 0, proc.stderr
-        assert not (probe / "INJECTED").exists(), \
-            "a quoted guest_name executed commands on the remote side " \
-            "(injection)"
-        stdin = (probe / "stdin").read_text()
-        cmd = (probe / "cmd").read_text()
-        assert name in stdin, \
-            "the guest_name did not reach the remote side as stdin data"
-        assert name not in cmd, \
-            "the guest_name was spliced into the remote command string"
-        # the discovery still works end-to-end for the odd-but-valid
-        # name: the IP is written back and the name survives as data
-        assert_ini_value(ini, "libvirt", "guest_ip", "192.0.2.50")
-        assert_ini_value(ini, "libvirt", "guest_name", name)
-
-    def test_hyperv_guest_name_is_data_not_code(self, sandbox, discover,
-                                                payload):
-        probe, name = payload
-        ini = make_ini(sandbox / "injection-hyperv.ini")
-        ini.write_text(ini.read_text().replace(
-            "guest_name=selftest-hyperv-guest", f"guest_name={name}"))
-        proc = discover(ini, "hyperv",
-                        env={"FAKE_SSH_MODE": "record",
-                             "FAKE_SSH_RECORD_DIR": str(probe)})
-        assert proc.returncode == 0, proc.stderr
-        assert not (probe / "INJECTED").exists(), \
-            "a quoted guest_name executed commands on the hyperv side " \
-            "(injection)"
-        cmd = (probe / "cmd").read_text()
-        stdin = (probe / "stdin").read_text()
-        assert name not in cmd, \
-            "the guest_name was spliced into the PowerShell command string"
-        assert name in stdin, \
-            "the guest_name did not reach the hyperv side as stdin data"
-        # the PowerShell query post-filters the adapter list by the
-        # EXACT name: -VMName alone treats wildcard characters as
-        # patterns, so a name containing * or ? must not be able to
-        # match a different VM
-        assert "Where-Object Name -eq $n" in cmd, \
-            "the PowerShell query does not post-filter by the exact VM name"
 
     def test_ahv_guest_name_percent_encoded(self, sandbox, discover,
                                              payload):
@@ -595,47 +630,41 @@ class TestRunTestsGuard:
             "run-tests.sh discovery guard lost its fallback warning"
 
 
-# --- the shared ssh transport baseline ------------------------------------
+# --- the shell-ssh retirement and the shared ssh transport baseline -------
 
 class TestSharedSshBaseline:
-    """lib.sh's SSH_BASE_OPTS/ssh_exec: the one transport baseline
-    every shell-side ssh invocation in systemtest/ builds on. Three
-    of the five historical sites carried no ConnectTimeout at all --
-    an unbounded ssh connect hangs its phase until the farm timeout
-    kills the job, the same LESSON-02 class as an unbounded curl.
-    The behavioral pin below exercises both invocation shapes the
-    discovery uses (the key path through ssh_exec, the password path
-    through the array spliced into a `sshpass -e ssh` line -- sshpass
-    execvp's the ssh binary itself, so the wrapper cannot be used
-    there); the source-level pins cover lib.sh's single definition
-    and the non-hermetic sites that splice it."""
+    """The libvirt/hyperv discovery queries ride hypervisor-builder's
+    own transport now, so they make NO shell ssh call anymore -- a
+    reintroduced shell query would re-open the command-injection
+    surface the hb conversion removed (behaviorally pinned below via
+    the marker ssh stub). The shell ssh sites that REMAIN in
+    systemtest/ still build on lib.sh's SSH_BASE_OPTS/ssh_exec
+    baseline: one definition of the options every shell-side ssh
+    invocation builds on, with a bounded connect on every site
+    (three of the five historical sites carried no ConnectTimeout at
+    all -- the same LESSON-02 class as an unbounded curl). The
+    source-level pins cover lib.sh's single definition and the
+    non-hermetic sites that splice it."""
 
-    def test_discovery_ssh_calls_carry_the_baseline(self, sandbox,
-                                                    discover):
-        # the recording ssh stub sees the full argv of every ssh the
-        # REAL script made; each family here exercises one transport
-        # shape (libvirt: the ssh_exec key path; hyperv: the sshpass
-        # splice)
-        record = sandbox / "ssh-record"
-        record.mkdir()
+    def test_discovery_makes_no_shell_ssh(self, sandbox, discover):
+        # the marker ssh stub touches FAKE_SSH_MARKER on EVERY
+        # invocation: after a libvirt and a hyperv discovery run
+        # through the fake hb, the marker must not exist
+        marker = sandbox / "ssh.marker"
         for family in ("libvirt", "hyperv"):
-            ini = make_ini(sandbox / f"baseline-{family}.ini")
+            ini = make_ini(sandbox / f"nossh-{family}.ini")
             proc = discover(ini, family,
-                            env={"FAKE_SSH_MODE": "record",
-                                 "FAKE_SSH_RECORD_DIR": str(record)})
+                            env={"FAKE_SSH_MARKER": str(marker)})
             assert proc.returncode == 0, proc.stderr
-            argv = (record / "argv").read_text()
-            assert "-o StrictHostKeyChecking=no" in argv, \
-                f"the {family} ssh call lost StrictHostKeyChecking=no"
-            assert "-o ConnectTimeout=10" in argv, \
-                f"the {family} ssh call lost its bounded connect"
-            assert "-o LogLevel=ERROR" in argv, \
-                f"the {family} ssh call lost the quiet log level"
+            assert not marker.exists(), \
+                f"the {family} discovery shelled out to ssh (the " \
+                "query must ride hypervisor-builder's transport)"
 
     def test_the_baseline_is_single_sourced_in_lib_sh(self):
         # the baseline is defined exactly once, in lib.sh, and
         # ssh_exec prepends it; a ConnectTimeout drop anywhere is one
-        # edit, caught here and by the behavioral pin above
+        # edit, caught here and by the mutation battery's
+        # ssh-baseline-connect-timeout entry
         lib = (SCRIPTS_DIR / "lib.sh").read_text()
         assert ("SSH_BASE_OPTS=(-o StrictHostKeyChecking=no "
                 "-o ConnectTimeout=10 -o LogLevel=ERROR)") in lib, \
