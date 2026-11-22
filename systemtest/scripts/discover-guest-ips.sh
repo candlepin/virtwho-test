@@ -8,23 +8,40 @@
 # This script runs just before pytest and asks the hypervisor's own
 # management plane for the guest's current address:
 #
-#   libvirt: ssh to the hypervisor, `virsh domifaddr` (guest agent
-#            first, the ARP table as fallback)
-#   hyperv:  ssh to the hypervisor, PowerShell Get-VMNetworkAdapter
+#   libvirt: hypervisor-builder's (hb) LibvirtCLI.guest_ip() -- virsh
+#            domifaddr over ssh, the guest agent first, the ARP
+#            table as fallback
+#   hyperv:  hypervisor-builder's HypervCLI.guest_ip() -- PowerShell
+#            Get-VMNetworkAdapter over ssh
 #   ahv:     Prism REST API over HTTPS (basic auth)
+#
+# The libvirt/hyperv queries are delegated to hb (discover_guest_ips.py,
+# invoked below): the knowledge of HOW to ask each hypervisor belongs
+# to hb, whose PR #43 carries the hardened forms this script used to
+# implement inline (the guest name rides the ssh session's stdin into
+# a fixed remote command string, the PowerShell adapter list is
+# post-filtered by the exact VM name, every query is bounded by a
+# timeout). The ahv query STAYS in this script: hb's AHVApi cannot
+# express vt's query semantics without hb-side changes (its
+# get_vm_by_name splices the guest name into the Prism URL unencoded,
+# and its guest_search takes the last NIC address instead of the first
+# non-loopback IPv4) -- converting ahv is a hypervisor-builder
+# follow-up (C5), and the hardening of the shell path below is not
+# weakened in the meantime.
 #
 # All inputs (server, username, password, guest_name) are read from the
 # ini; only the discovered guest_ip is written back -- never a
 # credential. The ini is DOWNLOADED, untrusted input, so its values are
-# data, never code: the guest_name reaches the remote side through
-# ssh's stdin (a fixed command string reads it into a remote variable)
-# and is percent-encoded for the ahv query -- it is never spliced
-# into a command string or a URL. A failed discovery is a warning,
-# not an error: the existing ini value is kept as the fallback, and
-# the run continues; VIRTWHO_SKIP_IP_DISCOVERY=1 skips the discovery
-# outright (labs with a known-good static guest_ip), and an overwrite
-# of a differing non-empty ini value is logged as a WARNING naming
-# both values.
+# data, never code: for libvirt/hyperv they reach hb as python
+# constructor/method arguments (only the ini path and the family name
+# ride discover_guest_ips.py's own command line), the ahv guest_name is
+# percent-encoded for the query -- nothing from the ini is ever
+# spliced into a command string or a URL. A failed discovery is a
+# warning, not an error: the existing ini value is kept as the
+# fallback, and the run continues;
+# VIRTWHO_SKIP_IP_DISCOVERY=1 skips the discovery outright (labs with
+# a known-good static guest_ip), and an overwrite of a differing
+# non-empty ini value is logged as a WARNING naming both values.
 #
 # Usage: discover-guest-ips.sh <ini-path> <hypervisor>
 #
@@ -64,10 +81,27 @@ if [ "${VIRTWHO_SKIP_IP_DISCOVERY:-}" = "1" ]; then
     exit 0
 fi
 
-first_ipv4() {
-    # First IPv4 address on stdin, loopback excluded (the domifaddr
-    # agent source reports the guest loopback alongside its real NIC).
-    grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -v '^127\.' | head -1 || true
+discover_via_hb() {
+    # libvirt/hyperv: the per-family query is hypervisor-builder's
+    # (hb) job now. Its LibvirtCLI/HypervCLI guest_ip() carry the
+    # hardened forms this script used to implement inline (the
+    # guest name rides the ssh session's stdin into a fixed remote
+    # command string, the PowerShell adapter list is post-filtered
+    # by the exact VM name, the libvirt agent source falls back to
+    # the ARP table) -- the knowledge of HOW to ask each hypervisor
+    # belongs to hb, shared by every consumer instead of re-derived
+    # per test suite. The ini values reach hb as python
+    # constructor/method ARGUMENTS (server/username/password into
+    # the CLI constructor, the guest name into guest_ip()): the ini
+    # is downloaded, untrusted input, and nothing from it is
+    # interpolated into a command string here -- only the ini path
+    # and the family name ride the python command line. A failed
+    # discovery (hb raising, hb answering None, missing ini values,
+    # the hyperv empty-password guard) prints nothing and exits
+    # non-zero: the caller's warning + fallback semantics apply
+    # exactly as before. Neither the helper nor this function
+    # prints credential values.
+    python3 "${SCRIPT_DIR}/discover_guest_ips.py" "$INI" "$HYP"
 }
 
 set_guest_ip() {
@@ -98,82 +132,6 @@ cfg.set(section, "guest_ip", value)
 with open(path, "w") as f:
     cfg.write(f, space_around_delimiters=False)
 PYEOF
-}
-
-ssh_output() {
-    # ssh_output <remote-command>: run a FIXED command on the
-    # hypervisor server and print its output. The ini-sourced
-    # guest_name is untrusted (a mis-published base ini could carry
-    # anything), so it is never interpolated into the remote command
-    # string -- it travels to the remote side through STDIN as data,
-    # and the remote snippet reads it into a variable before using
-    # it; a quote in the name cannot break out of the command.
-    # Key-based auth first, password fallback through sshpass -e so
-    # the password stays off the process list. Both invocations
-    # build on lib.sh's SSH_BASE_OPTS baseline (the sshpass side
-    # splices the array: sshpass execvp's the ssh binary itself).
-    # Returns non-zero when both paths fail.
-    local cmd=$1 out
-    if out=$(printf '%s\n' "$GUEST_NAME" | ssh_exec -o BatchMode=yes \
-        "${HYP_USER}@${HYP_SERVER}" "$cmd" 2>/dev/null); then
-        printf '%s' "$out"
-        return 0
-    fi
-    if [ -n "$HYP_PASS" ]; then
-        if out=$(printf '%s\n' "$GUEST_NAME" | SSHPASS="$HYP_PASS" sshpass -e ssh \
-            "${SSH_BASE_OPTS[@]}" "${HYP_USER}@${HYP_SERVER}" "$cmd" 2>/dev/null); then
-            printf '%s' "$out"
-            return 0
-        fi
-    fi
-    return 1
-}
-
-discover_libvirt() {
-    # virsh domifaddr on the hypervisor: the guest agent first (does
-    # not depend on the ARP cache), the hypervisor's ARP table as
-    # fallback for guests without an agent. The remote command is a
-    # fixed string that reads the guest name from stdin -- the name
-    # is ini input and must never become remote code.
-    local out ip
-    # shellcheck disable=SC2016  # single quotes are the point: the
-    # remote shell expands "$dom", the local one must not
-    out=$(ssh_output 'read -r dom; virsh domifaddr "$dom" --source agent') || true
-    ip=$(printf '%s\n' "$out" | first_ipv4)
-    if [ -z "$ip" ]; then
-        # shellcheck disable=SC2016  # same: expansion belongs remote
-        out=$(ssh_output 'read -r dom; virsh domifaddr "$dom" --source arp') || true
-        ip=$(printf '%s\n' "$out" | first_ipv4)
-    fi
-    printf '%s\n' "$ip"
-}
-
-discover_hyperv() {
-    # PowerShell Get-VMNetworkAdapter reports the addresses the
-    # hypervisor knows for the guest through its integration services;
-    # the parser picks the first IPv4 (IPv6 entries are ignored). The
-    # guest name rides on stdin ([Console]::In) into a PowerShell
-    # variable instead of the command line -- the name is ini input
-    # and must never become remote code. -VMName treats wildcard
-    # characters as patterns, so the adapter list is post-filtered by
-    # the EXACT name (a name containing * or ? must not match a
-    # different VM); like the libvirt path, an empty password skips
-    # straight to the failure path instead of attempting an
-    # empty-password login. The invocation splices lib.sh's
-    # SSH_BASE_OPTS array (sshpass execvp's the ssh binary itself,
-    # so the ssh_exec wrapper cannot be used here).
-    local out
-    if [ -z "$HYP_PASS" ]; then
-        return 1
-    fi
-    # shellcheck disable=SC2016  # single quotes are the point: the
-    # remote PowerShell expands $n, the local shell must not
-    out=$(printf '%s\n' "$GUEST_NAME" | SSHPASS="$HYP_PASS" sshpass -e ssh \
-        "${SSH_BASE_OPTS[@]}" \
-        "${HYP_USER}@${HYP_SERVER}" \
-        'PowerShell -Command "$n=[Console]::In.ReadToEnd().Trim(); (Get-VMNetworkAdapter -VMName $n | Where-Object Name -eq $n).IpAddresses"' \
-        2>/dev/null) || return 1
-    printf '%s\n' "$out" | first_ipv4
 }
 
 discover_ahv() {
@@ -256,14 +214,11 @@ HYP_PASS=${INI_VALUES[2]:-}
 GUEST_NAME=${INI_VALUES[3]:-}
 GUEST_IP_OLD=${INI_VALUES[4]:-}
 
-if [ "$HYP" = "libvirt" ]; then
-    # Accept a qemu+ssh://user@host/system URI and ssh to the bare host.
-    if [[ "$HYP_SERVER" == *"://"* ]]; then
-        HYP_SERVER=${HYP_SERVER#*://}
-        HYP_SERVER=${HYP_SERVER#*@}
-        HYP_SERVER=${HYP_SERVER%%/*}
-    fi
-fi
+# NOTE: the libvirt qemu+ssh://user@host/system URI normalization
+# moved into discover_guest_ips.py (the python helper hands hb the
+# bare host it connects to); the raw value here only feeds the
+# missing-values gate and the ahv path, which takes the server as
+# an HTTPS host name.
 
 if [ -z "$HYP_SERVER" ] || [ -z "$HYP_USER" ] || [ -z "$GUEST_NAME" ]; then
     echo "WARNING: [${HYP}] server/username/guest_name not all set in ${INI}; skipping guest-IP discovery" >&2
@@ -276,8 +231,7 @@ AHV_USER_ESC=$(printf '%s' "$HYP_USER" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
 AHV_PASS_ESC=$(printf '%s' "$HYP_PASS" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
 
 case "$HYP" in
-    libvirt) IP=$(discover_libvirt) || IP="" ;;
-    hyperv) IP=$(discover_hyperv) || IP="" ;;
+    libvirt | hyperv) IP=$(discover_via_hb) || IP="" ;;
     ahv) IP=$(discover_ahv) || IP="" ;;
 esac
 
