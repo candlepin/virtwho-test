@@ -24,5 +24,5 @@ rpdb
 # the libvirt/hyperv discovery queries ride): keeps this branch's CI
 # and dry-runs deterministic. Moves back to @master (or a release)
 # when hb#43 merges.
-git+https://github.com/candlepin/hypervisor-builder.git@f5e1e89
+git+https://github.com/candlepin/hypervisor-builder.git@a9bbe186b0e18f23d5442e5cde0e8f288595b4e3
 betelgeuse>=1.12,<2.0
