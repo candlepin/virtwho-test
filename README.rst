@@ -450,9 +450,32 @@ Environment variable                 Purpose
 ``VIRTWHO_INI_URL`` itself is a *plain* (non-secret) Testing Farm
 variable.
 
-The host-side self-tests for the generator/tmpfs plumbing and the
-guest-IP discovery live on the companion branch ``cct-3162/selftests``
-(stacked on this branch; merged immediately after it).
+Self-tests for the generator/tmpfs plumbing and the guest-IP
+discovery live under ``systemtest/selftest/`` as a pytest suite that
+runs the REAL scripts in throwaway ``/dev/shm`` sandboxes (fake
+hypervisor output, a fake Vault on loopback; no real credentials or
+network involved). It runs on every push and pull request in the
+``Lint`` workflow's ``selftest`` job and can be run manually::
+
+    python -m pytest systemtest/selftest/ -v
+
+Its host-side dependencies are declared in
+``systemtest/selftest/requirements.txt`` (installed by the lint job
+via ``pip install -r``); the repo-root ``requirements.txt`` pins the
+GUEST suite's environment -- including its older ``pytest`` -- and is
+intentionally separate. Always invoke the self-tests by path, as the
+lint job does: a bare ``pytest`` at the repository root also collects
+the guest suite's ``tests/`` (whose conftest expects a provisioned
+guest). To re-run a single test, paste its node ID from a ``-v`` run
+or select by name with ``-k`` (e.g. ``python -m pytest
+systemtest/selftest/ -k same_value``). The checkpoint parity of the
+bash-to-pytest conversion is recorded in
+``systemtest/selftest/PARITY.md``, and
+``systemtest/selftest/mutation-checks.sh`` is the matching
+maintainers' tool: it applies the standing battery of
+security-regression mutations to a throwaway copy of the tree and
+asserts the suite catches every one (local run, ~30 minutes -- 40
+full suite runs at ~45 s each; not part of the lint workflow).
 
 .. _virtwho-test: https://github.com/candlepin/virtwho-test
 .. _Eko: https://github.com/eko999
