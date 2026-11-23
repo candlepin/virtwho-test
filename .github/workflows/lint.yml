@@ -34,6 +34,34 @@ jobs:
       - name: shellcheck the shell scripts
         run: shellcheck -S warning systemtest/scripts/*.sh systemtest/tests/bootc/*.sh utils/*.sh *.sh
 
-  # The host-side self-test suite that used to run here lives on the
-  # companion branch cct-3162/selftests (stacked on this branch); its
-  # lint workflow carries the selftest job.
+  # The pytest self-test suite under systemtest/selftest/ is the
+  # functional evidence for the base-ini security contract
+  # (plaintext-credential scan, selective sentinel resolution,
+  # redirect refusal, the no-credentials gate) and extends it to the
+  # guest-IP discovery and the prepare/cleanup confinement plumbing.
+  # All of it is hermetic: mktemp under /dev/shm, a fake Vault on
+  # loopback with obviously-fake values, PATH-injected command
+  # stubs, no credentials, no egress -- so it runs on every push and
+  # pull request like the lint job. It is a host-side harness,
+  # deliberately NOT part of the Testing Farm guest plans (the plan
+  # only ever runs `pytest tests/` via run-tests.sh).
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Pinned to the full-length commit SHA of the release noted in
+      # the comment (a moving tag can be re-pointed upstream; a SHA
+      # cannot). Bump = repin to the new release tag's SHA.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      # The host-side dependency surface of the harness, kept
+      # deliberately separate from the repo-root requirements.txt
+      # (the guest suite's pin): pytest drives the suite, PyYAML is
+      # needed by the prepare-kubevirt.sh cases (the kubeconfig
+      # write). Installing from the harness's own requirements file
+      # keeps the documented manual run and CI in lockstep.
+      - run: pip install -r systemtest/selftest/requirements.txt
+      - name: Run the host-side self-tests
+        run: python -m pytest systemtest/selftest/ -v
