@@ -1,4 +1,5 @@
 import os
+import socket
 
 import paramiko
 
@@ -140,7 +141,12 @@ class SSHConnect:
         try:
             code = stdout.channel.recv_exit_status()
             stdout, stderr = stdout.read(), stderr.read()
-        except TimeoutError:
+        except (TimeoutError, socket.timeout):  # noqa: UP041
+            # socket.timeout is a distinct class from TimeoutError on
+            # Python < 3.10: catching only the latter let a channel
+            # timeout surface as a raw traceback there.
+            # (UP041 wants the alias dropped -- it only IS an alias
+            # on 3.10+, and the guest suite runs older Pythons.)
             logger.error(f"Command execution timed out after {timeout} seconds: {cmd}")
             self.close()
             raise FailException(f"Command timed out after {timeout} seconds: {cmd}")

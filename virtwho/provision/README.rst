@@ -23,17 +23,17 @@ configure no password ssh login for remote libvirt mode.
 
     * [virtwho]
     * server=
-    * username=root
-    * password=red2015
+    * username=CHANGE_ME
+    * password=CHANGE_ME
     * port=
 
 * Below are examples to run the file with required arguments.
 
     * # python3 virtwho_host.py --rhel-compose=RHEL-7.9-20200917.0 --variant=Server --arch=x86_64 --type=virtual
 
-    * # python3 virtwho_host.py --rhel-compose=RHEL-8.6.0-20220105.3 --server=10.10.10.10 --gating-msg=[JSON]
+    * # python3 virtwho_host.py --rhel-compose=RHEL-8.6.0-20220105.3 --server=192.0.2.10 --gating-msg=[JSON]
 
-    * # python3 virtwho_host.py --rhel-compose=RHEL-9.0.0-20220105.3 --arch=x86_64 --server=10.10.10.10 --virtwho-pkg-url=[URL]
+    * # python3 virtwho_host.py --rhel-compose=RHEL-9.0.0-20220105.3 --arch=x86_64 --server=192.0.2.10 --virtwho-pkg-url=[URL]
 
 
 
@@ -76,7 +76,7 @@ load manifest and set for virt-who testing.
 * Below are examples to run the file with required arguments.
 
     * # python3 virtwho_satellite.py --version=6.9 --repo=cdn --rhel-compose=RHEL-7.9-20200917.0
-    * # python3 virtwho_satellite.py --version=6.10 --repo=dogfood --rhel-compose=RHEL-7.9-20200917.0 --server=satellite.example.invalid --ssh-username=root --ssh-password=redhat --admin-username=admin --admin-password=password
+    * # python3 virtwho_satellite.py --version=6.10 --repo=dogfood --rhel-compose=RHEL-7.9-20200917.0 --server=satellite.example.invalid --ssh-username=root --ssh-password=CHANGE_ME --admin-username=admin --admin-password=CHANGE_ME
 
 
 

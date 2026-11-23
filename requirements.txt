@@ -1,5 +1,6 @@
 # The below packages are required to run this project
-# Other required packages could be found in the Dockerfile, such as https://gitlab.cee.redhat.com/virtwho/virtwho-jobs/-/blob/master/docker/fedora/Dockerfile-fedora39
+# Other required packages could be found in the Dockerfile of the container
+# image used by the CI pipelines (see the CI pipelines repository)
 # Line beginning with 'RUN yum -y install '
 pytest==7.2.2
 pytest-xdist
@@ -19,5 +20,9 @@ lxml
 funcy
 passlib
 rpdb
-git+https://github.com/VirtwhoQE/hypervisor-builder.git@master
+# Pinned to hb PR #43's branch head (the hardened guest_ip() forms
+# the libvirt/hyperv discovery queries ride): keeps this branch's CI
+# and dry-runs deterministic. Moves back to @master (or a release)
+# when hb#43 merges.
+git+https://github.com/candlepin/hypervisor-builder.git@6ccce5a6efda68eb93e0e491f671944b02ad0a7f
 betelgeuse>=1.12,<2.0

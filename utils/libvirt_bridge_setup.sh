@@ -30,7 +30,7 @@ DNS2=$(nmcli device show $DEV | grep 'IP4.DNS\[2\]' | awk '{print $2}')
 DNS3=$(nmcli device show $DEV | grep 'IP4.DNS\[3\]' | awk '{print $2}')
 NIC=$(ethtool -i $DEV | grep 'driver' | awk -F':' '{print $2}')
 
-if [[ $DEV != $br_name ]]; then
+if [[ $DEV != "$br_name" ]]; then
     nmcli c del "$DEV_CON"
     nmcli c add type bridge autoconnect yes con-name $br_name ifname $br_name
     nmcli c add type bridge-slave autoconnect yes con-name "$DEV_CON" ifname $DEV master $br_name

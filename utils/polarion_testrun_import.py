@@ -107,8 +107,10 @@ def arguments_parser():
     parser.add_argument(
         "--url",
         required=False,
-        default="https://polarion.engineering.redhat.com/polarion",
-        help="The polarion url to import test run",
+        default=os.environ.get(
+            "POLARION_URL", "https://polarion.example.invalid/polarion"
+        ),
+        help="The polarion url to import test run (default: the POLARION_URL environment variable, else a placeholder)",
     )
     parser.add_argument(
         "--username",
